@@ -30,7 +30,7 @@ on_err(){
 
 # Graceful abort on Ctrl+C / termination
 on_int(){
-	echo
+    echo
     echo "Aborted by user."
     exit 130
 }
