@@ -1,28 +1,37 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# Safe directory sync/copy helper
-# - Lets you choose a source and destination directory interactively
-# - Supports three backends: (cp + rm), rsync, rclone
-# - Makes a backup of the destination into /tmp before modifying it
-# - Performs safety checks: same path, root path, nesting, sensitive dirs
-# - Can elevate via sudo/doas and install missing tools via the system pkg mgr
+# Safe directory sync/copy helper — PREVIEW + COMMENTS (least-privilege)
+#
+# What this script does
+#   • Interactively asks for source and destination directories
+#   • Lets you choose a backend: (cp + rm), rsync, or rclone
+#   • Shows a PREVIEW before copying: how many files, total size, and an
+#     optional per-file list
+#   • Backs up current destination to /tmp before changing anything
+#   • Performs safety checks (same path, '/', nesting, sensitive dirs)
+#   • Avoids persistent sudo; elevates only when strictly needed (mkdir/rm,
+#     optional package installs). The copy itself runs unprivileged.
+#
+# Preview logic
+#   • cp: destination is cleaned before copy → preview = ALL source files
+#   • rsync/rclone: preview = files where size OR mtime differs between src/dst
 #
 # Notes
-# - Indentation uses 4 spaces (spaces, not literal tab characters)
-# - Requires Bash (for 'declare -g', 'shopt', '[[ ... ]]', etc.)
+#   • Indentation uses 4 spaces
+#   • Requires Bash features: [[ ... ]], declare -g, extglob, etc.
 # -----------------------------------------------------------------------------
 
-# Fail hard on errors, undefined vars, and pipeline errors
+# Fail fast on errors, undefined vars, and pipeline errors
 set -Eeuo pipefail
 
-# Tighter word splitting rules
+# Restrict word splitting to newlines/tabs only
 IFS=$'\n\t'
 
-# Enable extended globs for trimming (e.g., '*( )')
+# Enable bash extended globs (used for trimming and hidden-file patterns)
 shopt -s extglob
 
 # --------------------------- Error/Signal handlers ---------------------------
-# Print the failing line and command when an error occurs
+# Print failing line/command to help with debugging
 on_err(){
     echo
     echo "Error (line $LINENO): $BASH_COMMAND" >&2
@@ -38,117 +47,106 @@ on_int(){
 trap on_err ERR
 trap on_int INT TERM
 
-# Keepalive background sudo process PID (if started)
-SUDO_KEEPALIVE_PID=""
-
 # ------------------------------- Privileges ---------------------------------
-# setup_sudo
-# - Detects whether we are root, have sudo or doas, and configures the SUDO cmd
-# - If a TTY is present, acquires sudo creds and keeps them alive in background
+# We do NOT keep sudo creds alive; we only attempt elevation when needed.
+# If sudo/doas is present, it will prompt on first privileged operation.
+SUDO=""
 setup_sudo(){
     if [[ $EUID -eq 0 ]]; then
         SUDO=""
         return 0
     fi
-
     if command -v sudo >/dev/null 2>&1; then
-        if sudo -n true 2>/dev/null; then
-            SUDO="sudo -n"
+        SUDO="sudo"
+        return 0
+    fi
+    if command -v doas >/dev/null 2>&1; then
+        SUDO="doas"
+        return 0
+    fi
+    SUDO=""  # no helper available; privileged ops will fail with a message
+}
+
+# mkdir_safe <path>
+#   Create directory, elevating only if parent is not writable
+mkdir_safe(){
+    local target="$1" parent
+    parent=$(dirname -- "$target")
+    if [[ -w "$parent" ]]; then
+        mkdir -p -- "$target"
+    else
+        if [[ -n "$SUDO" ]]; then
+            $SUDO mkdir -p -- "$target"
         else
-            if [[ -t 0 ]]; then
-                echo "Elevated privileges are required. You'll be prompted for your password."
-                sudo -v || { echo "Cannot obtain sudo credentials."; exit 1; }
-                ( while true; do sudo -n true; sleep 60; done ) 2>/dev/null &
-                SUDO_KEEPALIVE_PID=$!
-                # Ensure we kill the keepalive on any exit
-                trap '[[ -n "${SUDO_KEEPALIVE_PID:-}" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null' EXIT
-                SUDO="sudo"
+            echo "Cannot create '$target' (no permission and no sudo/doas)." >&2
+            exit 1
+        fi
+    fi
+}
+
+# rm_tree_contents_safe <dir>
+#   Remove ALL contents of a directory (including dotfiles), elevating only if
+#   the directory is not writable by the current user.
+rm_tree_contents_safe(){
+    local dir="$1"
+    (
+        shopt -s dotglob nullglob
+        if [[ -w "$dir" ]]; then
+            rm -rf -- "$dir"/{*,.[!.]*,..?*} || true
+        else
+            if [[ -n "$SUDO" ]]; then
+                $SUDO rm -rf -- "$dir"/{*,.[!.]*,..?*} || true
             else
-                echo "Error: need privileges but no TTY to prompt; re-run with sudo." >&2
+                echo "Cannot clean '$dir' (no permission and no sudo/doas)." >&2
                 exit 1
             fi
         fi
-        return 0
-    fi
-
-    if command -v doas >/dev/null 2>&1; then
-        if doas -n true 2>/dev/null; then
-            SUDO="doas -n"
-        else
-            SUDO="doas"
-        fi
-        return 0
-    fi
-
-    echo "Error: not root and neither 'sudo' nor 'doas' found. Re-run as root." >&2
-    exit 1
-}
-
-# as_root
-# - Thin wrapper to run a command with our configured privilege helper
-as_root(){
-    ${SUDO:-} "$@"
+    )
 }
 
 # ---------------------------- Package management ----------------------------
-# Globals populated by detect_pkg_manager()
-PKG_MGR=""
-PKG_UPDATE=""
-PKG_INSTALL=""
-
-# detect_pkg_manager
-# - Detects host package manager and prepares update/install commands
-# - Never uses sudo for Homebrew (brew)
-# - Uses noninteractive flags where sensible
-#
-# Exposes:
-#   PKG_MGR     - name (apt, dnf, yum, zypper, pacman, apk, brew)
-#   PKG_UPDATE  - command to refresh package metadata
-#   PKG_INSTALL - command to install packages (expects pkgnames appended)
+# Detect a package manager and build helper commands:
+#   PKG_UPDATE   – refresh package metadata (run at most once per session)
+#   PKG_INSTALL  – install packages, appending the names we pass in
+PKG_MGR=""; PKG_UPDATE=""; PKG_INSTALL=""; PKG_UPDATED=0
 
 detect_pkg_manager(){
     if command -v apt-get >/dev/null 2>&1; then
         PKG_MGR="apt"
-        PKG_UPDATE="${SUDO:-} apt-get update -qq"
-        PKG_INSTALL="${SUDO:-} env DEBIAN_FRONTEND=noninteractive apt-get install -y"
+        PKG_UPDATE="${SUDO:+$SUDO }apt-get update -qq"
+        PKG_INSTALL="${SUDO:+$SUDO }env DEBIAN_FRONTEND=noninteractive apt-get install -y"
     elif command -v apt >/dev/null 2>&1; then
         PKG_MGR="apt"
-        PKG_UPDATE="${SUDO:-} apt update -qq"
-        PKG_INSTALL="${SUDO:-} env DEBIAN_FRONTEND=noninteractive apt install -y"
+        PKG_UPDATE="${SUDO:+$SUDO }apt update -qq"
+        PKG_INSTALL="${SUDO:+$SUDO }env DEBIAN_FRONTEND=noninteractive apt install -y"
     elif command -v dnf >/dev/null 2>&1; then
         PKG_MGR="dnf"
-        PKG_UPDATE="${SUDO:-} dnf -y makecache"
-        PKG_INSTALL="${SUDO:-} dnf -y install"
+        PKG_UPDATE="${SUDO:+$SUDO }dnf -y makecache"
+        PKG_INSTALL="${SUDO:+$SUDO }dnf -y install"
     elif command -v yum >/dev/null 2>&1; then
         PKG_MGR="yum"
-        PKG_UPDATE="${SUDO:-} yum -y makecache"
-        PKG_INSTALL="${SUDO:-} yum -y install"
+        PKG_UPDATE="${SUDO:+$SUDO }yum -y makecache"
+        PKG_INSTALL="${SUDO:+$SUDO }yum -y install"
     elif command -v zypper >/dev/null 2>&1; then
         PKG_MGR="zypper"
-        PKG_UPDATE="${SUDO:-} zypper --non-interactive refresh"
-        PKG_INSTALL="${SUDO:-} zypper --non-interactive install --no-confirm"
+        PKG_UPDATE="${SUDO:+$SUDO }zypper --non-interactive refresh"
+        PKG_INSTALL="${SUDO:+$SUDO }zypper --non-interactive install --no-confirm"
     elif command -v pacman >/dev/null 2>&1; then
         PKG_MGR="pacman"
-        PKG_UPDATE="${SUDO:-} pacman -Sy --noconfirm"
-        PKG_INSTALL="${SUDO:-} pacman -S --noconfirm --needed"
+        PKG_UPDATE="${SUDO:+$SUDO }pacman -Sy --noconfirm"
+        PKG_INSTALL="${SUDO:+$SUDO }pacman -S --noconfirm --needed"
     elif command -v apk >/dev/null 2>&1; then
         PKG_MGR="apk"
-        PKG_UPDATE=":"   # Alpine refreshes on install with --no-cache
-        PKG_INSTALL="${SUDO:-} apk add --no-cache"
+        PKG_UPDATE=":"   # Alpine: refresh during install with --no-cache
+        PKG_INSTALL="${SUDO:+$SUDO }apk add --no-cache"
     elif command -v brew >/dev/null 2>&1; then
         PKG_MGR="brew"
         PKG_UPDATE="brew update"
         PKG_INSTALL="brew install"
-    else
-        PKG_MGR=""
-        PKG_UPDATE=""
-        PKG_INSTALL=""
     fi
 }
 
-# pkg_update_once
-# - Asks the user whether to refresh package metadata; ensures it's run at most once
-PKG_UPDATED=0
+# Ask once whether to refresh metadata (useful for apt/dnf/yum)
 pkg_update_once(){
     [[ -z "$PKG_UPDATE" ]] && return 0
     if (( PKG_UPDATED == 0 )); then
@@ -160,33 +158,27 @@ pkg_update_once(){
 }
 
 # ensure_installed <pkg> [<pkg>...]
-# - Installs the given packages using the detected package manager
-# - If we cannot detect a package manager, we fail fast
+#   Try to install packages using the detected manager. If none, fail fast.
 ensure_installed(){
     if [[ -z "$PKG_INSTALL" ]]; then
-        echo "Cannot install packages automatically: no supported package manager detected." >&2
+        echo "Cannot install packages automatically (no pkg manager or no sudo/doas)." >&2
         return 1
     fi
     pkg_update_once
-    # shellcheck disable=SC2086  # we want word splitting of pkgs here
+    # shellcheck disable=SC2086 – we intentionally expand args here
     eval "$PKG_INSTALL" $*
 }
 
 # ------------------------------- UI helpers ---------------------------------
 # yesno "<prompt>" <DEFAULT>
-# - Repeatedly prompts the user for Y/N, with default on empty input
-# - Accepts: Y, YES, N, NO (case-insensitive). Also 'q'/'quit'/'exit' to abort.
+#   Ask a yes/no question repeatedly; default applies on empty input.
 yesno(){
     local message="$1" default="$2" answer
     while true; do
         read -rp "$message" answer || true
         [[ -z "${answer:-}" ]] && answer="$default"
-
-        # Trim spaces and lowercase (requires extglob)
-        answer="${answer##*( )}"
-        answer="${answer%%*( )}"
-        answer="${answer,,}"
-
+        # trim + lowercase
+        answer="${answer##*( )}"; answer="${answer%%*( )}"; answer="${answer,,}"
         case "$answer" in
             y|yes) return 0 ;;
             n|no)  return 1 ;;
@@ -196,190 +188,247 @@ yesno(){
     done
 }
 
-# choose_dir "<human label>" <var_suffix> [create]
-# - Prompts for a directory path until it exists (or creates it if allowed)
-# - On success, sets global var: absolute_<var_suffix> with canonicalized path
+# choose_dir "<label>" <suffix> [create]
+#   Prompt until an existing dir is given (or create it when allowed). On success
+#   defines a global variable absolute_<suffix> that stores the canonical path.
 choose_dir(){
     local message="$1" type="$2" create="${3-}" answer resolved
     while true; do
         read -rp "Enter $message: " answer || true
         if [[ -d "${answer:-}" ]]; then
-            resolved=$(readlink -f -- "$answer")
-            declare -g "absolute_${type}=$resolved"
-            return 0
+            resolved=$(readlink -f -- "$answer"); declare -g "absolute_${type}=$resolved"; return 0
         fi
-
         if [[ -n "$create" ]]; then
             if yesno "This directory doesn't exist... Create it? (Y/n): " Y; then
-                as_root mkdir -p -- "$answer"
-                resolved=$(readlink -f -- "$answer")
-                declare -g "absolute_${type}=$resolved"
-                echo "Directory created successfully."
-                return 0
+                mkdir_safe "$answer"
+                resolved=$(readlink -f -- "$answer"); declare -g "absolute_${type}=$resolved"
+                echo "Directory created successfully."; return 0
             fi
         else
-            echo "This directory doesn't exist... Input a correct path"
-            echo
+            echo "This directory doesn't exist... Input a correct path"; echo
         fi
     done
+}
+
+# ------------------------------ Preview helpers -----------------------------
+# Portable stat helpers (GNU/BSD)
+stat_bytes(){  # print file size in bytes
+    stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1"
+}
+stat_mtime(){  # print mtime (epoch seconds)
+    stat -c %Y -- "$1" 2>/dev/null || stat -f %m -- "$1"
+}
+
+# Build list of all source files with sizes (relative paths)
+# stdout: "<size>\t<relative_path>"
+build_src_list(){
+    ( cd "$absolute_src" && find . -type f -printf '%s\t%P\n' )
+}
+
+# Generic delta builder (backend-agnostic for rsync/rclone):
+# - Includes files that are new or changed in src vs dst (size OR mtime differ)
+# - stdout: "<size>\t<relative_path>"
+build_delta_list_generic(){
+    ( cd "$absolute_src" && find . -type f -print0 ) |
+    while IFS= read -r -d '' rel; do
+        rel="${rel#./}"
+        src_f="$absolute_src/$rel"
+        dst_f="$absolute_dst/$rel"
+
+        ssz="$(stat_bytes "$src_f" 2>/dev/null || echo 0)"
+        if [[ ! -f "$dst_f" ]]; then
+            printf '%s\t%s\n' "$ssz" "$rel"
+        else
+            dsz="$(stat_bytes "$dst_f" 2>/dev/null || echo -1)"
+            smt="$(stat_mtime "$src_f" 2>/dev/null || echo 0)"
+            dmt="$(stat_mtime "$dst_f" 2>/dev/null || echo 0)"
+            if [[ "$ssz" != "$dsz" || "$smt" -ne "$dmt" ]]; then
+                printf '%s\t%s\n' "$ssz" "$rel"
+            fi
+        fi
+    done
+}
+
+# Human-readable bytes
+hr_bytes(){
+    local b=$1 d=0 s=(B KB MB GB TB PB EB ZB YB)
+    while (( b >= 1024 && d < ${#s[@]}-1 )); do b=$(( b/1024 )); d=$(( d+1 )); done
+    echo "$b ${s[$d]}"
+}
+
+# Print preview summary and optionally list files
+# src_tmp/delta_tmp must contain "<size>\t<path>" lines
+preview_print_summary(){
+    local src_tmp="$1" delta_tmp="$2" title="$3" src_count src_size delta_count delta_size
+
+    src_count=$(wc -l < "$src_tmp" | tr -d ' ')
+    src_size=$(awk -F '\t' '{s+=$1} END{print s+0}' "$src_tmp")
+
+    delta_count=$(wc -l < "$delta_tmp" | tr -d ' ')
+    delta_size=$(awk -F '\t' '{s+=$1} END{print s+0}' "$delta_tmp")
+
+    echo
+    echo "Preview — $title"
+    echo "Source files:   $src_count"
+    echo "Source size:    $(hr_bytes "$src_size") ($src_size bytes)"
+    echo "Will transfer:  $delta_count"
+    echo "Transfer size:  $(hr_bytes "$delta_size") ($delta_size bytes)"
+
+    if (( delta_count > 0 )); then
+        if yesno "Show list of files to transfer? (y/N): " N; then
+            if command -v less >/dev/null 2>&1 && [[ -t 1 ]]; then
+                cut -f2- "$delta_tmp" | less -R
+            else
+                cut -f2- "$delta_tmp"
+            fi
+        fi
+    fi
+}
+
+# Build and show preview
+run_preview(){
+    if yesno "Preview copy plan first? (Y/n): " Y; then
+        local src_tmp delta_tmp title
+        src_tmp=$(mktemp)
+        delta_tmp=$(mktemp)
+
+        build_src_list > "$src_tmp"
+        case "$SELECTED_TOOL" in
+            cp)
+                # cp will clear destination ⇒ everything from src will be copied
+                build_src_list > "$delta_tmp"; title="full copy from source" ;;
+            *)
+                # rsync/rclone: backend-agnostic size+mtime delta
+                build_delta_list_generic > "$delta_tmp"; title="delta (size+mtime)" ;;
+        esac
+
+        preview_print_summary "$src_tmp" "$delta_tmp" "$title"
+
+        rm -f "$src_tmp" "$delta_tmp"
+
+        yesno "Proceed with copy? (Y/n): " Y || { echo "Aborted before copy."; exit 0; }
+    fi
 }
 
 # ------------------------------ Tool selection ------------------------------
 SELECTED_TOOL=""
 
-# cp_tool
-# - Uses built-in cp+rm (from coreutils). If missing, offers to install "coreutils".
+# cp backend (coreutils)
 cp_tool(){
     if command -v cp >/dev/null 2>&1 && command -v rm >/dev/null 2>&1; then
-        SELECTED_TOOL="cp"
-        echo "Selected: Standard (rm+cp)"
-        return 0
+        SELECTED_TOOL="cp"; echo "Selected: Standard (rm+cp)"; return 0
     fi
-
     echo "cp or rm not found."
     if yesno "Install coreutils now? (Y/n): " Y; then
         ensure_installed coreutils || return 1
-        SELECTED_TOOL="cp"
-        echo "Selected: Standard (rm+cp)"
-        return 0
+        SELECTED_TOOL="cp"; echo "Selected: Standard (rm+cp)"; return 0
     fi
-
-    echo "Not installing; choose another tool."
-    return 1
+    echo "Not installing; choose another tool."; return 1
 }
 
-# rsync_tool
-# - Uses rsync; installs it if missing and user agrees.
+# rsync backend
 rsync_tool(){
     if ! command -v rsync >/dev/null 2>&1; then
         if yesno "rsync is not installed. Install it now? (Y/n): " Y; then
             ensure_installed rsync || return 1
         else
-            echo "Not installing; choose another tool."
-            return 1
+            echo "Not installing; choose another tool."; return 1
         fi
     fi
-    SELECTED_TOOL="rsync"
-    echo "Selected: rsync"
-    return 0
+    SELECTED_TOOL="rsync"; echo "Selected: rsync"; return 0
 }
 
-# rclone_tool
-# - Uses rclone; installs it if missing and user agrees.
+# rclone backend
 rclone_tool(){
     if ! command -v rclone >/dev/null 2>&1; then
         if yesno "rclone is not installed. Install it now? (Y/n): " Y; then
             ensure_installed rclone || return 1
         else
-            echo "Not installing; choose another tool."
-            return 1
+            echo "Not installing; choose another tool."; return 1
         fi
     fi
-    SELECTED_TOOL="rclone"
-    echo "Selected: rclone"
-    return 0
+    SELECTED_TOOL="rclone"; echo "Selected: rclone"; return 0
 }
 
-# choose_tool <default_number>
-# - Interactive menu to pick the backend tool
+# Minimal interactive picker for the backend
 choose_tool(){
     local default="$1" choice
     while true; do
-        echo "Choose copy tool:"
-        echo "1) Standard (cp + rm)"
-        echo "2) rsync"
-        echo "3) rclone"
+        echo "Choose copy tool:"; echo "1) Standard (cp + rm)"; echo "2) rsync"; echo "3) rclone"
         read -rp "Select: " choice || true
         [[ -z "${choice:-}" ]] && choice=$default
-
-        # Trim spaces
-        choice="${choice##*( )}"
-        choice="${choice%%*( )}"
-
+        choice="${choice##*( )}"; choice="${choice%%*( )}"
         case "$choice" in
-            1)  cp_tool    && return 0 ;;
-            2)  rsync_tool && return 0 ;;
-            3)  rclone_tool&& return 0 ;;
-            *)  echo "-----------"; echo "Enter number from 1 to 3"; echo ;;
+            1) cp_tool && return 0 ;;
+            2) rsync_tool && return 0 ;;
+            3) rclone_tool && return 0 ;;
+            *) echo "-----------"; echo "Enter number from 1 to 3"; echo ;;
         esac
     done
 }
 
 # ------------------------------- Main routine -------------------------------
 main(){
+    # 1) Setup privilege helper (no keepalive) and detect package manager
     setup_sudo
     detect_pkg_manager
 
-    # 1) Ask user for source & destination (create dest if needed)
+    # 2) Ask for source/destination; offer to create destination
     choose_dir "source directory" src
     choose_dir "destination directory" dst create
 
     echo
 
-    # 2) Safety checks
-    # 2a) Same path check
+    # 3) Safety checks before touching anything
+    #    3a) Same path
     if [[ "$absolute_src" == "$absolute_dst" ]]; then
-        echo "Source and destination are the same. Aborting..." >&2
-        echo
-        exit 1
+        echo "Source and destination are the same. Aborting..." >&2; echo; exit 1
     fi
-
-    # 2b) Destination is root path
+    #    3b) Destination MUST NOT be '/'
     if [[ "$absolute_dst" == "/" ]]; then
-        echo "Destination path is '/'. Aborting..." >&2
-        echo
-        exit 1
+        echo "Destination path is '/'. Aborting..." >&2; echo; exit 1
     fi
-
-    # 2c) Nesting (src in dst or dst in src)
+    #    3c) Nesting in either direction leads to destructive surprises
     if [[ "$absolute_src/" == "$absolute_dst"/* || "$absolute_dst/" == "$absolute_src"/* ]]; then
-        echo "Source and destination are nested. Aborting." >&2
-        echo
-        exit 1
+        echo "Source and destination are nested. Aborting." >&2; echo; exit 1
     fi
-
-    # 2d) Sensitive directories (like /etc, /var, ...)
+    #    3d) Extra confirmation for sensitive single-component dirs
     if [[ "$absolute_dst" =~ ^/(etc|home|var|bin|usr|lib|opt|tmp|srv|dev|mnt|media|proc|run|sys)(/)?$ ]]; then
         echo "Destination is a sensitive directory: $absolute_dst"
         yesno "Do you want to continue? (y/N): " N || { echo "Aborted..."; exit 1; }
         yesno "Are you absolutely sure? (y/N): " N || { echo "Aborted..."; exit 1; }
     fi
 
-    # 3) Pick a tool (default: 1 => cp + rm)
+    # 4) Pick backend (default 1 => cp + rm)
     choose_tool 1
 
-    # 4) Backup existing destination to /tmp
-    local backup
+    # 5) PREVIEW — show what will be copied and how much
+    run_preview
+
+    # 6) Backup existing destination to /tmp (if it exists)
+    local backup="(none)"
     if [[ -e "$absolute_dst" ]]; then
-        # Create a unique backup dir and copy the current destination contents into it
         backup=$(mktemp -d "/tmp/$(basename -- "$absolute_dst").$(date +%Y%m%dT%H%M%S%3N).XXXX")
         cp -a -- "$absolute_dst"/. "$backup"/
-    else
-        backup="(none)"
     fi
 
-    # 5) Execute the chosen sync/copy strategy
+    # 7) Execute the chosen strategy
     case "$SELECTED_TOOL" in
         rsync)
-            # -a  : archive mode (recursive, preserves attrs)
-            # -H  : preserve hard links
-            # --delete : make dst mirror src (remove extraneous files from dst)
-            # --info=progress2 : nice progress display
+            # -a : archive (recursive, preserve perms/times/etc.)
+            # -H : preserve hard links
+            # --delete : make dst mirror src (remove extraneous files)
+            # --info=progress2 : progress bar for the whole transfer
             rsync -aH --delete --info=progress2 -- "$absolute_src"/ "$absolute_dst"/
             ;;
         rclone)
-            # sync : make dst exactly match src (deletes extras)
-            # --copy-links : follow symlinks and copy the pointed-to files
-            # --local-no-check-updated : speed up local copies
+            # 'sync' makes dst exactly match src; --copy-links follows symlinks
+            # --local-no-check-updated optimizes local copies
             rclone sync --progress --copy-links --local-no-check-updated -- "$absolute_src" "$absolute_dst"
             ;;
         cp|*)
-            # For cp, we emulate a "sync" by clearing the destination first (incl. dotfiles),
-            # then copying the source contents.
-            (
-                shopt -s dotglob nullglob
-                as_root rm -rf -- "$absolute_dst"/{*,.[!.]*,..?*} || true
-            )
+            # Emulate "sync": clear destination first (incl. dotfiles), then copy
+            rm_tree_contents_safe "$absolute_dst"
             cp -a -- "$absolute_src"/. "$absolute_dst"/
             ;;
     esac
