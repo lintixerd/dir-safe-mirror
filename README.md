@@ -1,4 +1,4 @@
-# Smart Mirror Copy (Bash)
+# Dir Safe Mirror (Bash)
 
 A small interactive Bash script to **mirror** one directory into another using your choice of engine:
 
