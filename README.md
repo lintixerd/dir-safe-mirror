@@ -6,31 +6,32 @@ A small interactive Bash script to **mirror** one directory into another using y
 * **rsync**: `rsync -aH --delete --info=progress2`
 * **rclone**: `rclone sync`
 
-It performs basic safety checks and makes a **backup of the destination** in `/tmp` before syncing.
+It performs safety checks and makes a **backup of the destination** in `/tmp` before syncing.
 
 ---
 
 ## Features
 
 * Engine selection: **cp**, **rsync**, or **rclone**
+* **Preview** before copying: total files, total size, optional per-file list
 * Safety checks:
 
   * Source and destination must differ
-  * Refuse destination `/`
-  * Warn for “sensitive” paths (`/etc`, `/var`, `/usr`, …)
-  * Detect nesting (src inside dst or dst inside src)
-* Destination backup: `/tmp/<basename(dst)>.HH:MM:SS:ms-bak`
+  * Destination `/` is refused
+  * Extra confirmation for “sensitive” paths (`/etc`, `/var`, `/usr`, …)
+  * Detects nesting (src inside dst or dst inside src)
+* Destination backup to `/tmp` using a timestamped temp directory
 * Graceful abort on **Ctrl+C**
-* Minimal, dependency-light, interactive flow
+* Least privilege: elevates only when required (mkdir/rm, optional installs)
 
-> If `rsync`/`rclone` are not installed, the script asks you to pick another engine (no auto-installation).
+> If `rsync`/`rclone` are missing, the script can **offer to install** them (with your confirmation). Otherwise, pick another engine.
 
 ---
 
 ## Requirements
 
 * **Linux** with **Bash ≥ 4.2** (uses `${var,,}` and `declare -g`)
-* **GNU coreutils** (`readlink -f`)
+* **GNU coreutils** (for `readlink -f`)
 * Optional:
 
   * `rsync` for the rsync engine
@@ -42,7 +43,7 @@ It performs basic safety checks and makes a **backup of the destination** in `/t
 
 ## Install
 
-Save the script as, for example, `mirror.sh`, then make it executable:
+Save the script as `mirror.sh`, then make it executable:
 
 ```bash
 chmod +x mirror.sh
@@ -75,22 +76,41 @@ On completion, the script prints where the destination backup was saved.
 
 ---
 
+## Preview Logic
+
+* **cp**: destination is cleared before copy → preview = **all source files**.
+* **rsync / rclone**: preview = files where **size OR mtime** differs between `src` and `dst` (computed locally and engine-agnostic).
+
+The preview shows:
+
+* Count and total size **in source**
+* Count and total size that **will be transferred**
+* Optional per-file list
+
+---
+
 ## Engine Behavior
 
-| Engine     | Command (simplified)                                                         | Notes                                                                                                                             |
-| ---------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| **cp**     | `rm -rf "$dst"/*` → `cp -af "$src"/. "$dst"/`                                | Fast & simple. **Does not remove hidden files** in `$dst` that don’t exist in `$src` (because `"$dst"/*` doesn’t match dotfiles). |
-| **rsync**  | `rsync -aH --delete --info=progress2 "$src"/ "$dst"/`                        | True mirror. Deletes extraneous files (including hidden), shows progress, preserves hard links.                                   |
-| **rclone** | `rclone sync --progress --copy-links --local-no-check-updated "$src" "$dst"` | True mirror via rclone (local→local), with detailed progress.                                                                     |
+| Engine     | Command (simplified)                                                         | Notes                                                                                 |
+| ---------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| **cp**     | `rm -rf "$dst"/{*,.[!.]*,..?*}` → `cp -a "$src"/. "$dst"/`                   | Emulates mirror by clearing destination first (**including hidden files**) then copy. |
+| **rsync**  | `rsync -aH --delete --info=progress2 "$src"/ "$dst"/`                        | True mirror. Deletes extraneous files, shows progress, preserves hard links.          |
+| **rclone** | `rclone sync --progress --copy-links --local-no-check-updated "$src" "$dst"` | Mirror via rclone (local→local) with progress; follows symlinks on copy.              |
 
 ---
 
 ## Backup
 
-Before syncing, the current destination is copied to:
+Before syncing, the current destination is copied to a unique, timestamped temp directory, e.g.:
 
 ```
-/tmp/<basename(dst)>.HH:MM:SS:ms-bak
+/tmp/<basename(dst)>.YYYYMMDDTHHMMSSmmm.XXXX
+```
+
+Example:
+
+```
+/tmp/data.20250822T203012123.Kf8s
 ```
 
 Backups remain in `/tmp` until the system cleans them up.
@@ -121,7 +141,13 @@ Choose copy tool:
 Select: 2
 Selected: rsync
 
-The task was completed successfully. Previous data backed up to: /tmp/dst.12:34:56:123-bak
+Preview — delta (size+mtime)
+Source files:   21
+Source size:    543 KB (556556 bytes)
+Will transfer:  5
+Transfer size:  123 KB (126000 bytes)
+
+The task was completed successfully. Previous data backed up to: /tmp/dst.20250822T203012123.w3Qf
 ```
 
 ---
@@ -129,7 +155,5 @@ The task was completed successfully. Previous data backed up to: /tmp/dst.12:34:
 ## Known Limitations
 
 * Linux-only assumptions (`readlink -f`, Bash ≥ 4.2).
-* `cp` engine won’t remove hidden files not present in source.
-* No automatic installation of `rsync`/`rclone`.
-
----
+* No checksum comparison in preview (size+mtime only).
+* Optional package installation is offered only when a supported package manager is detected.
