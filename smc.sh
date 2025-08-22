@@ -31,10 +31,11 @@ IFS=$'\n\t'
 shopt -s extglob
 
 # ------------------------------- CLI args (help & stubs) -------------------------------
-# NOTE: Only help (-h/--help) is functional. All other flags are recognized
-# but NOT IMPLEMENTED and are ignored. No behavior changes are made.
+# NOTE: -h/--help, --version, and --dry-run are functional. All other flags are
+# recognized but NOT IMPLEMENTED and are ignored. No behavior changes are made.
 SCRIPT_NAME="${0##*/}"
-VERSION="0.1.0-dev"
+VERSION="0.3.0"
+DRY_RUN=0
 declare -a ARGS_UNIMPL=()
 
 print_help(){
@@ -45,7 +46,11 @@ Safe directory sync/copy helper — PREVIEW + COMMENTS (least-privilege)
 
 Options:
   -h, --help            Show this help and exit.
-  --dry-run             [NOT IMPLEMENTED] Preview only; do not modify anything.
+  --version             Print version and exit.
+  --dry-run             Run in no-change mode: do not create/modify/delete anything,
+                        skip package updates/installs, preview runs automatically,
+                        and there is no proceed prompt.
+
   --copy                [NOT IMPLEMENTED] Non-interactive copy using current/defaults.
   --config FILE         [NOT IMPLEMENTED] Load options from a config file.
   -t, --tool TOOL       [NOT IMPLEMENTED] Preselect backend: cp | rsync | rclone.
@@ -59,11 +64,14 @@ Additional (stubs):
   --no-backup           [NOT IMPLEMENTED] Do not create the /tmp backup of destination.
   --no-confirm          [NOT IMPLEMENTED] Assume safe defaults without prompting.
   --log FILE            [NOT IMPLEMENTED] Append actions to FILE.
-  --version             [NOT IMPLEMENTED] Print version and exit.
 
 Notes:
-  • All flags except -h/--help are placeholders and currently do nothing.
+  • All flags except -h/--help, --version, and --dry-run are placeholders and currently do nothing.
 EOF
+}
+
+print_version(){
+    echo "$SCRIPT_NAME $VERSION"
 }
 
 parse_args(){
@@ -73,7 +81,14 @@ parse_args(){
                 print_help
                 exit 0
                 ;;
-            --version|--dry-run|--copy|--no-sudo|--no-backup|--no-confirm|--log)
+            --version)
+                print_version
+                exit 0
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                ;;
+            --copy|--no-sudo|--no-backup|--no-confirm|--log)
                 ARGS_UNIMPL+=("$1")
                 # consume value for flags that expect one
                 if [[ "$1" == "--log" ]]; then
@@ -216,6 +231,11 @@ detect_pkg_manager(){
 pkg_update_once(){
     [[ -z "$PKG_UPDATE" ]] && return 0
     if (( PKG_UPDATED == 0 )); then
+        if (( DRY_RUN )); then
+            echo "DRY-RUN: skipping package metadata update."
+            PKG_UPDATED=1
+            return 0
+        fi
         if yesno "Update package lists now? (Y/n): " Y; then
             eval "$PKG_UPDATE"
         fi
@@ -226,6 +246,10 @@ pkg_update_once(){
 # ensure_installed <pkg> [<pkg>...]
 #   Try to install packages using the detected manager. If none, fail fast.
 ensure_installed(){
+    if (( DRY_RUN )); then
+        echo "DRY-RUN: would install: $*"
+        return 0
+    fi
     if [[ -z "$PKG_INSTALL" ]]; then
         echo "Cannot install packages automatically (no pkg manager or no sudo/doas)." >&2
         return 1
@@ -254,6 +278,17 @@ yesno(){
     done
 }
 
+# path_abs "<path>"
+#   Compute absolute path without requiring it to exist (used for --dry-run).
+path_abs(){
+    local p="$1"
+    if [[ "$p" == /* ]]; then
+        printf '%s\n' "$p"
+    else
+        printf '%s\n' "$PWD/$p"
+    fi
+}
+
 # choose_dir "<label>" <suffix> [create]
 #   Prompt until an existing dir is given (or create it when allowed). On success
 #   defines a global variable absolute_<suffix> that stores the canonical path.
@@ -265,6 +300,12 @@ choose_dir(){
             resolved=$(readlink -f -- "$answer"); declare -g "absolute_${type}=$resolved"; return 0
         fi
         if [[ -n "$create" ]]; then
+            if (( DRY_RUN )); then
+                echo "DRY-RUN: directory does not exist and will not be created: $answer"
+                resolved=$(path_abs "$answer"); declare -g "absolute_${type}=$resolved"
+                echo "Using intended path for preview: $resolved"
+                return 0
+            fi
             if yesno "This directory doesn't exist... Create it? (Y/n): " Y; then
                 mkdir_safe "$answer"
                 resolved=$(readlink -f -- "$answer"); declare -g "absolute_${type}=$resolved"
@@ -353,27 +394,39 @@ preview_print_summary(){
 
 # Build and show preview
 run_preview(){
-    if yesno "Preview copy plan first? (Y/n): " Y; then
-        local src_tmp delta_tmp title
-        src_tmp=$(mktemp)
-        delta_tmp=$(mktemp)
+    local force_preview=0
+    (( DRY_RUN )) && force_preview=1
 
-        build_src_list > "$src_tmp"
-        case "$SELECTED_TOOL" in
-            cp)
-                # cp will clear destination ⇒ everything from src will be copied
-                build_src_list > "$delta_tmp"; title="full copy from source" ;;
-            *)
-                # rsync/rclone: backend-agnostic size+mtime delta
-                build_delta_list_generic > "$delta_tmp"; title="delta (size+mtime)" ;;
-        esac
-
-        preview_print_summary "$src_tmp" "$delta_tmp" "$title"
-
-        rm -f "$src_tmp" "$delta_tmp"
-
-        yesno "Proceed with copy? (Y/n): " Y || { echo "Aborted before copy."; exit 0; }
+    if (( ! force_preview )); then
+        if ! yesno "Preview copy plan first? (Y/n): " Y; then
+            return 0
+        fi
     fi
+
+    local src_tmp delta_tmp title
+    src_tmp=$(mktemp)
+    delta_tmp=$(mktemp)
+
+    build_src_list > "$src_tmp"
+    case "$SELECTED_TOOL" in
+        cp)
+            # cp will clear destination ⇒ everything from src will be copied
+            build_src_list > "$delta_tmp"; title="full copy from source" ;;
+        *)
+            # rsync/rclone: backend-agnostic size+mtime delta
+            build_delta_list_generic > "$delta_tmp"; title="delta (size+mtime)" ;;
+    esac
+
+    preview_print_summary "$src_tmp" "$delta_tmp" "$title"
+
+    rm -f "$src_tmp" "$delta_tmp"
+
+    # In dry-run: no proceed prompt
+    if (( DRY_RUN )); then
+        return 0
+    fi
+
+    yesno "Proceed with copy? (Y/n): " Y || { echo "Aborted before copy."; exit 0; }
 }
 
 # ------------------------------ Tool selection ------------------------------
@@ -385,6 +438,10 @@ cp_tool(){
         SELECTED_TOOL="cp"; echo "Selected: Standard (rm+cp)"; return 0
     fi
     echo "cp or rm not found."
+    if (( DRY_RUN )); then
+        echo "DRY-RUN: would install coreutils."
+        SELECTED_TOOL="cp"; echo "Selected: Standard (rm+cp)"; return 0
+    fi
     if yesno "Install coreutils now? (Y/n): " Y; then
         ensure_installed coreutils || return 1
         SELECTED_TOOL="cp"; echo "Selected: Standard (rm+cp)"; return 0
@@ -395,6 +452,10 @@ cp_tool(){
 # rsync backend
 rsync_tool(){
     if ! command -v rsync >/dev/null 2>&1; then
+        if (( DRY_RUN )); then
+            echo "DRY-RUN: would install rsync."
+            SELECTED_TOOL="rsync"; echo "Selected: rsync"; return 0
+        fi
         if yesno "rsync is not installed. Install it now? (Y/n): " Y; then
             ensure_installed rsync || return 1
         else
@@ -407,6 +468,10 @@ rsync_tool(){
 # rclone backend
 rclone_tool(){
     if ! command -v rclone >/dev/null 2>&1; then
+        if (( DRY_RUN )); then
+            echo "DRY-RUN: would install rclone."
+            SELECTED_TOOL="rclone"; echo "Selected: rclone"; return 0
+        fi
         if yesno "rclone is not installed. Install it now? (Y/n): " Y; then
             ensure_installed rclone || return 1
         else
@@ -435,7 +500,7 @@ choose_tool(){
 
 # ------------------------------- Main routine -------------------------------
 main(){
-    # 0) Parse CLI flags — only -h/--help works; others are stubs
+    # 0) Parse CLI flags — -h/--help, --version, --dry-run work; others are stubs
     parse_args "$@"
     if (( ${#ARGS_UNIMPL[@]} > 0 )); then
         echo "Note: the following CLI options/args are recognized but NOT IMPLEMENTED and will be ignored:"
@@ -478,6 +543,12 @@ main(){
 
     # 5) PREVIEW — show what will be copied and how much
     run_preview
+
+    # In dry-run mode, stop here (no backup, no copy)
+    if (( DRY_RUN )); then
+        echo "DRY-RUN: no changes made."
+        exit 0
+    fi
 
     # 6) Backup existing destination to /tmp (if it exists)
     local backup="(none)"
