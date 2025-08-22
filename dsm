@@ -31,11 +31,12 @@ IFS=$'\n\t'
 shopt -s extglob
 
 # ------------------------------- CLI args (help & stubs) -------------------------------
-# NOTE: -h/--help, --version, and --dry-run are functional. All other flags are
-# recognized but NOT IMPLEMENTED and are ignored. No behavior changes are made.
+# NOTE: -h/--help, --version, --dry-run, and -t/--tool are functional.
+# All other flags are recognized but NOT IMPLEMENTED and are ignored.
 SCRIPT_NAME="${0##*/}"
 VERSION="0.3.0"
 DRY_RUN=0
+TOOL_CHOICE=""
 declare -a ARGS_UNIMPL=()
 
 print_help(){
@@ -50,10 +51,10 @@ Options:
   --dry-run             Run in no-change mode: do not create/modify/delete anything,
                         skip package updates/installs, preview runs automatically,
                         and there is no proceed prompt.
+  -t, --tool TOOL       Preselect backend: cp | rsync | rclone.
 
   --copy                [NOT IMPLEMENTED] Non-interactive copy using current/defaults.
   --config FILE         [NOT IMPLEMENTED] Load options from a config file.
-  -t, --tool TOOL       [NOT IMPLEMENTED] Preselect backend: cp | rsync | rclone.
   -s, --src DIR         [NOT IMPLEMENTED] Source directory path.
   -d, --dst DIR         [NOT IMPLEMENTED] Destination directory path.
   --skip STEPS          [NOT IMPLEMENTED] Comma-separated steps to skip:
@@ -66,7 +67,7 @@ Additional (stubs):
   --log FILE            [NOT IMPLEMENTED] Append actions to FILE.
 
 Notes:
-  • All flags except -h/--help, --version, and --dry-run are placeholders and currently do nothing.
+  • All flags except -h/--help, --version, --dry-run, and -t/--tool are placeholders and currently do nothing.
 EOF
 }
 
@@ -88,26 +89,34 @@ parse_args(){
             --dry-run)
                 DRY_RUN=1
                 ;;
+            -t|--tool)
+                shift || { echo "Missing value for --tool" >&2; exit 2; }
+                TOOL_CHOICE="${1,,}"
+                case "$TOOL_CHOICE" in
+                    cp|rsync|rclone) : ;;
+                    *) echo "Unknown tool: $TOOL_CHOICE (expected: cp|rsync|rclone)" >&2; exit 2 ;;
+                esac
+                ;;
             --copy|--no-sudo|--no-backup|--no-confirm|--log)
                 ARGS_UNIMPL+=("$1")
                 # consume value for flags that expect one
                 if [[ "$1" == "--log" ]]; then
-                    if [[ $# -ge 2 && "$2" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
+                    if [[ $# -ge 2 && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
                 fi
                 ;;
-            --config|--skip|-t|--tool|-s|--src|-d|--dst)
+            --config|--skip|-s|--src|-d|--dst)
                 ARGS_UNIMPL+=("$1")
-                if [[ $# -ge 2 && "$2" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
+                if [[ $# -ge 2 && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
                 ;;
             --*)  # any other long option: record as stub
                 ARGS_UNIMPL+=("$1")
-                if [[ $# -ge 2 && "$2" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
+                if [[ $# -ge 2 && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
                 ;;
             *)    # positional arguments (not used): record as stub
                 ARGS_UNIMPL+=("$1")
                 ;;
         esac
-        shift
+        shift || true
     done
 }
 
@@ -481,6 +490,15 @@ rclone_tool(){
     SELECTED_TOOL="rclone"; echo "Selected: rclone"; return 0
 }
 
+select_tool_by_name(){
+    case "${1,,}" in
+        cp) cp_tool ;;
+        rsync) rsync_tool ;;
+        rclone) rclone_tool ;;
+        *) echo "Unknown tool: $1 (expected: cp|rsync|rclone)" >&2; return 2 ;;
+    esac
+}
+
 # Minimal interactive picker for the backend
 choose_tool(){
     local default="$1" choice
@@ -500,7 +518,7 @@ choose_tool(){
 
 # ------------------------------- Main routine -------------------------------
 main(){
-    # 0) Parse CLI flags — -h/--help, --version, --dry-run work; others are stubs
+    # 0) Parse CLI flags — -h/--help, --version, --dry-run, --tool work; others are stubs
     parse_args "$@"
     if (( ${#ARGS_UNIMPL[@]} > 0 )); then
         echo "Note: the following CLI options/args are recognized but NOT IMPLEMENTED and will be ignored:"
@@ -538,8 +556,13 @@ main(){
         yesno "Are you absolutely sure? (y/N): " N || { echo "Aborted..."; exit 1; }
     fi
 
-    # 4) Pick backend (default 1 => cp + rm)
-    choose_tool 1
+    # 4) Select backend
+    if [[ -n "$TOOL_CHOICE" ]]; then
+        select_tool_by_name "$TOOL_CHOICE" || exit $?
+    fi
+    if [[ -z "$SELECTED_TOOL" ]]; then
+        choose_tool 1
+    fi
 
     # 5) PREVIEW — show what will be copied and how much
     run_preview
@@ -560,15 +583,11 @@ main(){
     # 7) Execute the chosen strategy
     case "$SELECTED_TOOL" in
         rsync)
-            # -a : archive (recursive, preserve perms/times/etc.)
-            # -H : preserve hard links
-            # --delete : make dst mirror src (remove extraneous files)
-            # --info=progress2 : progress bar for the whole transfer
+            # -a : archive; -H : preserve hard links; --delete : mirror; progress info
             rsync -aH --delete --info=progress2 -- "$absolute_src"/ "$absolute_dst"/
             ;;
         rclone)
-            # 'sync' makes dst exactly match src; --copy-links follows symlinks
-            # --local-no-check-updated optimizes local copies
+            # make dst exactly match src; follow symlinks; optimize local copies
             rclone sync --progress --copy-links --local-no-check-updated -- "$absolute_src" "$absolute_dst"
             ;;
         cp|*)
