@@ -31,10 +31,10 @@ IFS=$'\n\t'
 shopt -s extglob
 
 # ------------------------------- CLI args (help & stubs) -------------------------------
-# NOTE: Only help (-h/--help) is functional. All other flags are recognized
+# NOTE: Only -h/--help and --version are functional. All other flags are recognized
 # but NOT IMPLEMENTED and are ignored. No behavior changes are made.
 SCRIPT_NAME="${0##*/}"
-VERSION="0.1.0-dev"
+VERSION="0.3.0"
 declare -a ARGS_UNIMPL=()
 
 print_help(){
@@ -45,6 +45,7 @@ Safe directory sync/copy helper — PREVIEW + COMMENTS (least-privilege)
 
 Options:
   -h, --help            Show this help and exit.
+  --version             Print version and exit.
   --dry-run             [NOT IMPLEMENTED] Preview only; do not modify anything.
   --copy                [NOT IMPLEMENTED] Non-interactive copy using current/defaults.
   --config FILE         [NOT IMPLEMENTED] Load options from a config file.
@@ -59,11 +60,14 @@ Additional (stubs):
   --no-backup           [NOT IMPLEMENTED] Do not create the /tmp backup of destination.
   --no-confirm          [NOT IMPLEMENTED] Assume safe defaults without prompting.
   --log FILE            [NOT IMPLEMENTED] Append actions to FILE.
-  --version             [NOT IMPLEMENTED] Print version and exit.
 
 Notes:
-  • All flags except -h/--help are placeholders and currently do nothing.
+  • All flags except -h/--help and --version are placeholders and currently do nothing.
 EOF
+}
+
+print_version(){
+    echo "$SCRIPT_NAME $VERSION"
 }
 
 parse_args(){
@@ -73,7 +77,11 @@ parse_args(){
                 print_help
                 exit 0
                 ;;
-            --version|--dry-run|--copy|--no-sudo|--no-backup|--no-confirm|--log)
+            --version)
+                print_version
+                exit 0
+                ;;
+            --dry-run|--copy|--no-sudo|--no-backup|--no-confirm|--log)
                 ARGS_UNIMPL+=("$1")
                 # consume value for flags that expect one
                 if [[ "$1" == "--log" ]]; then
@@ -435,7 +443,7 @@ choose_tool(){
 
 # ------------------------------- Main routine -------------------------------
 main(){
-    # 0) Parse CLI flags — only -h/--help works; others are stubs
+    # 0) Parse CLI flags — only -h/--help and --version work; others are stubs
     parse_args "$@"
     if (( ${#ARGS_UNIMPL[@]} > 0 )); then
         echo "Note: the following CLI options/args are recognized but NOT IMPLEMENTED and will be ignored:"
