@@ -19,6 +19,10 @@
 # Notes
 #   • Indentation uses 4 spaces
 #   • Requires Bash features: [[ ... ]], declare -g, extglob, etc.
+#   • Config file (auto-created if missing):
+#       ${XDG_CONFIG_HOME:-$HOME/.config}/dsm/config
+#     Legacy fallback is read-only if present: ~/.dsm/config
+#     Keys: tool, log, skip, dry_run, no_sudo, src, dst, rsync_opts, rclone_opts, cp_opts
 # -----------------------------------------------------------------------------
 
 # Fail fast on errors, undefined vars, and pipeline errors
@@ -31,15 +35,32 @@ IFS=$'\n\t'
 shopt -s extglob
 
 # ------------------------------- CLI args (help & stubs) -------------------------------
-# NOTE: -h/--help, --version, --dry-run, -t/--tool, -s/--src, and -d/--dst are functional.
-# All other flags are recognized but NOT IMPLEMENTED and are ignored.
+# NOTE: -h/--help, --version, --dry-run, -t/--tool, -s/--src, -d/--dst,
+#       --config, --log, and --skip are functional. Others remain stubs.
 SCRIPT_NAME="${0##*/}"
 VERSION="0.5.0"
 DRY_RUN=0
 TOOL_CHOICE=""
 CLI_SRC=""
 CLI_DST=""
+CLI_LOG=""
+CLI_SKIP=""
+CONFIG_FILE=""
 declare -a ARGS_UNIMPL=()
+
+# Effective configuration (populated from config + CLI)
+LOG_FILE=""
+SKIP_PREVIEW=0
+SKIP_BACKUP=0
+SKIP_SAFETY=0
+DISALLOW_SUDO=0
+CFG_TOOL=""
+CFG_DRY_RUN=""
+CFG_SRC=""
+CFG_DST=""
+RSYNC_OPTS_EXTRA=""
+RCLONE_OPTS_EXTRA=""
+CP_OPTS_EXTRA=""
 
 print_help(){
     cat <<EOF
@@ -50,31 +71,175 @@ Safe directory sync/copy helper — PREVIEW + COMMENTS (least-privilege)
 Options:
   -h, --help            Show this help and exit.
   --version             Print version and exit.
-  --dry-run             Run in no-change mode: do not create/modify/delete anything,
-                        skip package updates/installs, preview runs automatically,
-                        and there is no proceed prompt.
+  --dry-run             No-change mode (also usable via config: dry_run=true).
   -t, --tool TOOL       Preselect backend: cp | rsync | rclone.
   -s, --src DIR         Source directory path (non-interactive).
   -d, --dst DIR         Destination directory path (non-interactive).
-
-  --copy                [NOT IMPLEMENTED] Non-interactive copy using current/defaults.
-  --config FILE         [NOT IMPLEMENTED] Load options from a config file.
-  --skip STEPS          [NOT IMPLEMENTED] Comma-separated steps to skip:
-                        preview,backup,safety
+  --config FILE         Load configuration from FILE. If FILE does not exist, it
+                        will be created automatically with sane defaults.
+                        Default location (auto-created on first run):
+                        ${XDG_CONFIG_HOME:-$HOME/.config}/dsm/config
+                        (legacy fallback is read-only: ~/.dsm/config)
+  --log FILE            Append actions to FILE (overrides config 'log=...').
+  --skip STEPS          Comma list of steps to skip: preview,backup,safety
+                        (merges with config 'skip=...').
 
 Additional (stubs):
-  --no-sudo             [NOT IMPLEMENTED] Disallow any privilege escalation.
-  --no-backup           [NOT IMPLEMENTED] Do not create the /tmp backup of destination.
-  --no-confirm          [NOT IMPLEMENTED] Assume safe defaults without prompting.
-  --log FILE            [NOT IMPLEMENTED] Append actions to FILE.
+  --no-sudo             [NOT IMPLEMENTED via CLI] Use config 'no_sudo=true' instead.
+  --no-backup           [NOT IMPLEMENTED via CLI] Use '--skip backup' or config 'skip=backup'.
+  --no-confirm          [NOT IMPLEMENTED]
+  --copy                [NOT IMPLEMENTED]
+
+Config file (key=value), example:
+  tool=rsync
+  log=~/dsm.log
+  skip=preview,backup
+  dry_run=false
+  no_sudo=false
+  src=~/src/project
+  dst=/mnt/backup/project
+  rsync_opts=--partial --mkpath
+  rclone_opts=--transfers 8
+  cp_opts=
 
 Notes:
-  • All flags except -h/--help, --version, --dry-run, -t/--tool, -s/--src, and -d/--dst are placeholders and currently do nothing.
+  • CLI overrides config; skip lists are merged (union).
 EOF
 }
 
 print_version(){
     echo "$SCRIPT_NAME $VERSION"
+}
+
+# --------------- Config loading (key=value, '#' comments, '~' expand) ---------------
+expand_tilde(){
+    local p="${1-}"
+    [[ -z "$p" ]] && { printf '%s\n' ""; return 0; }
+    if [[ "$p" == "~" || "$p" == "~/"* ]]; then
+        printf '%s\n' "${p/#\~/$HOME}"
+    else
+        printf '%s\n' "$p"
+    fi
+}
+
+trim(){
+    local s="${1-}"
+    s="${s##*( )}"; s="${s%%*( )}"
+    printf '%s' "$s"
+}
+
+# Create a default config file with secure permissions if it does not exist
+ensure_default_config(){
+    local target="$1"
+    local parent; parent="$(dirname -- "$target")"
+    mkdir -p -- "$parent" 2>/dev/null || true
+    if [[ -e "$target" ]]; then
+        return 0
+    fi
+    local now; now="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    local state_base="${XDG_STATE_HOME:-$HOME/.local/state}"
+    local default_log="$state_base/dsm/dsm.log"
+
+    umask 077
+    {
+        echo "# dsm configuration (auto-created)"
+        echo "# File: $target"
+        echo "# Created: $now"
+        echo "# Format: key=value  (lines starting with '#' are comments)"
+        echo "# Keys:"
+        echo "#   tool          = cp | rsync | rclone"
+        echo "#   log           = /path/to/logfile"
+        echo "#   skip          = comma list: preview,backup,safety"
+        echo "#   dry_run       = true | false"
+        echo "#   no_sudo       = true | false"
+        echo "#   src           = /path/to/source"
+        echo "#   dst           = /path/to/destination"
+        echo "#   rsync_opts    = extra rsync options"
+        echo "#   rclone_opts   = extra rclone options"
+        echo "#   cp_opts       = extra cp options"
+        echo
+        echo "tool=cp"
+        echo "log=$default_log"
+        echo "skip="
+        echo "dry_run=false"
+        echo "no_sudo=false"
+        echo "src="
+        echo "dst="
+        echo "rsync_opts="
+        echo "rclone_opts="
+        echo "cp_opts="
+    } > "$target" 2>/dev/null || {
+        echo "Warning: cannot create config at $target (permission denied?)." >&2
+        return 1
+    }
+    chmod 600 "$target" 2>/dev/null || true
+}
+
+load_config_file(){
+    local f="$1"
+    [[ -z "$f" ]] && return 0
+    [[ -f "$f" ]] || return 0
+
+    while IFS= read -r line || [[ -n "${line-}" ]]; do
+        line="${line%%#*}"
+        line="$(trim "$line")"
+        [[ -z "$line" ]] && continue
+        local key="${line%%=*}"
+        local val="${line#*=}"
+        key="$(trim "${key,,}")"
+        val="$(trim "$val")"
+        case "$key" in
+            tool)          CFG_TOOL="${val,,}" ;;
+            log)           LOG_FILE="$(expand_tilde "$val")" ;;
+            skip)          parse_skip_list "$val" ;;
+            dry_run)       [[ "${val,,}" == "true" || "$val" == "1" ]] && CFG_DRY_RUN=1 || CFG_DRY_RUN=0 ;;
+            no_sudo)       [[ "${val,,}" == "true" || "$val" == "1" ]] && DISALLOW_SUDO=1 || DISALLOW_SUDO=0 ;;
+            src)           CFG_SRC="$(expand_tilde "$val")" ;;
+            dst)           CFG_DST="$(expand_tilde "$val")" ;;
+            rsync_opts)    RSYNC_OPTS_EXTRA="$val" ;;
+            rclone_opts)   RCLONE_OPTS_EXTRA="$val" ;;
+            cp_opts)       CP_OPTS_EXTRA="$val" ;;
+            *) : ;;
+        esac
+    done < "$f"
+}
+
+# Merge skips from a comma list into flags
+parse_skip_list(){
+    local list="${1-}"
+    [[ -z "$list" ]] && return 0
+    local IFS=,
+    for p in $list; do
+        p="$(trim "${p,,}")"
+        case "$p" in
+            preview) SKIP_PREVIEW=1 ;;
+            backup)  SKIP_BACKUP=1 ;;
+            safety)  SKIP_SAFETY=1 ;;
+            *) : ;;
+        esac
+    done
+}
+
+# ---------------------------- Two-phase arg handling ----------------------------
+# Pre-scan for --config to set CONFIG_FILE (also auto-create if missing)
+prescan_for_config(){
+    local i=1
+    while (( i <= $# )); do
+        eval "arg=\${$i-}"
+        if [[ "$arg" == "--config" ]]; then
+            local j=$((i+1))
+            eval "val=\${$j-}"
+            if [[ -z "${val-}" || "$val" == -* ]]; then
+                echo "Missing value for --config" >&2
+                exit 2
+            fi
+            CONFIG_FILE="$val"
+            # Auto-create custom config path if missing
+            ensure_default_config "$CONFIG_FILE" || true
+            return 0
+        fi
+        i=$((i+1))
+    done
 }
 
 parse_args(){
@@ -92,7 +257,6 @@ parse_args(){
                 DRY_RUN=1
                 ;;
             -t|--tool)
-                # Robustly require a value that is not another flag
                 if [[ -z "${2:-}" || "${2:-}" == -* ]]; then
                     echo "Missing value for --tool" >&2
                     exit 2
@@ -102,35 +266,56 @@ parse_args(){
                     cp|rsync|rclone) : ;;
                     *) echo "Unknown tool: $TOOL_CHOICE (expected: cp|rsync|rclone)" >&2; exit 2 ;;
                 esac
-                shift  # consume flag; loop's shift will consume value
+                shift
                 ;;
             -s|--src)
-                # Require a following path; avoid referencing \$1 after a shift with set -u
                 if [[ -z "${2:-}" || "${2:-}" == -* ]]; then
                     echo "Missing value for --src" >&2
                     exit 2
                 fi
-                CLI_SRC="$2"
-                shift  # consume flag; loop's shift will consume value
+                CLI_SRC="$(expand_tilde "$2")"
+                shift
                 ;;
             -d|--dst)
                 if [[ -z "${2:-}" || "${2:-}" == -* ]]; then
                     echo "Missing value for --dst" >&2
                     exit 2
                 fi
-                CLI_DST="$2"
+                CLI_DST="$(expand_tilde "$2")"
                 shift
                 ;;
-            --copy|--no-sudo|--no-backup|--no-confirm|--log)
-                ARGS_UNIMPL+=("$1")
-                # consume value for flags that expect one
-                if [[ "$1" == "--log" ]]; then
-                    if [[ -n "${2:-}" && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
+            --config)
+                if [[ -z "${2:-}" || "${2:-}" == -* ]]; then
+                    echo "Missing value for --config" >&2
+                    exit 2
                 fi
+                CONFIG_FILE="$2"
+                # If user supplies a path and it doesn't exist, create it now
+                ensure_default_config "$CONFIG_FILE" || true
+                shift
                 ;;
-            --config|--skip)
+            --log)
+                if [[ -z "${2:-}" || "${2:-}" == -* ]]; then
+                    echo "Missing value for --log" >&2
+                    exit 2
+                fi
+                CLI_LOG="$(expand_tilde "$2")"
+                shift
+                ;;
+            --skip)
+                if [[ -z "${2:-}" || "${2:-}" == -* ]]; then
+                    echo "Missing value for --skip" >&2
+                    exit 2
+                fi
+                CLI_SKIP="$2"
+                shift
+                ;;
+            --copy|--no-sudo|--no-backup|--no-confirm)
                 ARGS_UNIMPL+=("$1")
-                if [[ -n "${2:-}" && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
+                ;;
+            --log=*|--skip=*|--config=*|-t=*|-s=*|-d=*)
+                echo "Use space-separated form (e.g., --log FILE), '=' form not supported." >&2
+                exit 2
                 ;;
             --*)  # any other long option: record as stub
                 ARGS_UNIMPL+=("$1")
@@ -145,44 +330,60 @@ parse_args(){
 }
 
 # --------------------------- Error/Signal handlers ---------------------------
-# Print failing line/command to help with debugging
 on_err(){
     echo
     echo "Error (line $LINENO): $BASH_COMMAND" >&2
+    logmsg "ERROR line=$LINENO cmd=$(printf '%q' "$BASH_COMMAND")"
 }
 
-# Graceful abort on Ctrl+C / termination
 on_int(){
     echo
     echo "Aborted by user."
+    logmsg "ABORT_BY_USER"
     exit 130
 }
 
 trap on_err ERR
 trap on_int INT TERM
 
+# ------------------------------- Logging ---------------------------------
+logmsg(){
+    [[ -z "${LOG_FILE:-}" ]] && return 0
+    local ts; ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    printf '%s %s\n' "$ts" "$*" >> "$LOG_FILE" || true
+}
+
+init_log(){
+    [[ -z "${LOG_FILE:-}" ]] && return 0
+    local dir; dir="$(dirname -- "$LOG_FILE")"
+    mkdir -p -- "$dir" 2>/dev/null || true
+    if ! touch -- "$LOG_FILE" 2>/dev/null; then
+        echo "Warning: cannot write to log file: $LOG_FILE" >&2
+        LOG_FILE=""
+    fi
+}
+
 # ------------------------------- Privileges ---------------------------------
-# We do NOT keep sudo creds alive; we only attempt elevation when needed.
-# If sudo/doas is present, it will prompt on first privileged operation.
 SUDO=""
 setup_sudo(){
+    if (( DISALLOW_SUDO )); then
+        SUDO=""
+        return 0
+    fi
     if [[ $EUID -eq 0 ]]; then
         SUDO=""
         return 0
     fi
     if command -v sudo >/dev/null 2>&1; then
-        SUDO="sudo"
-        return 0
+        SUDO="sudo"; return 0
     fi
     if command -v doas >/dev/null 2>&1; then
-        SUDO="doas"
-        return 0
+        SUDO="doas"; return 0
     fi
     SUDO=""  # no helper available; privileged ops will fail with a message
 }
 
 # mkdir_safe <path>
-#   Create directory, elevating only if parent is not writable
 mkdir_safe(){
     local target="$1" parent
     parent=$(dirname -- "$target")
@@ -199,8 +400,6 @@ mkdir_safe(){
 }
 
 # rm_tree_contents_safe <dir>
-#   Remove ALL contents of a directory (including dotfiles), elevating only if
-#   the directory is not writable by the current user.
 rm_tree_contents_safe(){
     local dir="$1"
     (
@@ -219,9 +418,6 @@ rm_tree_contents_safe(){
 }
 
 # ---------------------------- Package management ----------------------------
-# Detect a package manager and build helper commands:
-#   PKG_UPDATE   – refresh package metadata (run at most once per session)
-#   PKG_INSTALL  – install packages, appending the names we pass in
 PKG_MGR=""; PKG_UPDATE=""; PKG_INSTALL=""; PKG_UPDATED=0
 
 detect_pkg_manager(){
@@ -260,7 +456,6 @@ detect_pkg_manager(){
     fi
 }
 
-# Ask once whether to refresh metadata (useful for apt/dnf/yum)
 pkg_update_once(){
     [[ -z "$PKG_UPDATE" ]] && return 0
     if (( PKG_UPDATED == 0 )); then
@@ -276,8 +471,6 @@ pkg_update_once(){
     fi
 }
 
-# ensure_installed <pkg> [<pkg>...]
-#   Try to install packages using the detected manager. If none, fail fast.
 ensure_installed(){
     if (( DRY_RUN )); then
         echo "DRY-RUN: would install: $*"
@@ -288,19 +481,16 @@ ensure_installed(){
         return 1
     fi
     pkg_update_once
-    # shellcheck disable=SC2086 – we intentionally expand args here
+    # shellcheck disable=SC2086
     eval "$PKG_INSTALL" $*
 }
 
 # ------------------------------- UI helpers ---------------------------------
-# yesno "<prompt>" <DEFAULT>
-#   Ask a yes/no question repeatedly; default applies on empty input.
 yesno(){
     local message="$1" default="$2" answer
     while true; do
         read -rp "$message" answer || true
         [[ -z "${answer:-}" ]] && answer="$default"
-        # trim + lowercase
         answer="${answer##*( )}"; answer="${answer%%*( )}"; answer="${answer,,}"
         case "$answer" in
             y|yes) return 0 ;;
@@ -311,8 +501,6 @@ yesno(){
     done
 }
 
-# path_abs "<path>"
-#   Compute absolute path without requiring it to exist (used for --dry-run).
 path_abs(){
     local p="$1"
     if [[ "$p" == /* ]]; then
@@ -322,9 +510,6 @@ path_abs(){
     fi
 }
 
-# choose_dir "<label>" <suffix> [create]
-#   Prompt until an existing dir is given (or create it when allowed). On success
-#   defines a global variable absolute_<suffix> that stores the canonical path.
 choose_dir(){
     local message="$1" type="$2" create="${3-}" answer resolved
     while true; do
@@ -351,30 +536,19 @@ choose_dir(){
 }
 
 # ------------------------------ Preview helpers -----------------------------
-# Portable stat helpers (GNU/BSD)
-stat_bytes(){  # print file size in bytes
-    stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1"
-}
-stat_mtime(){  # print mtime (epoch seconds)
-    stat -c %Y -- "$1" 2>/dev/null || stat -f %m -- "$1"
-}
+stat_bytes(){ stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1"; }
+stat_mtime(){ stat -c %Y -- "$1" 2>/dev/null || stat -f %m -- "$1"; }
 
-# Build list of all source files with sizes (relative paths)
-# stdout: "<size>\t<relative_path>"
 build_src_list(){
     ( cd "$absolute_src" && find . -type f -printf '%s\t%P\n' )
 }
 
-# Generic delta builder (backend-agnostic for rsync/rclone):
-# - Includes files that are new or changed in src vs dst (size OR mtime differ)
-# - stdout: "<size>\t<relative_path>"
 build_delta_list_generic(){
     ( cd "$absolute_src" && find . -type f -print0 ) |
     while IFS= read -r -d '' rel; do
         rel="${rel#./}"
         src_f="$absolute_src/$rel"
         dst_f="$absolute_dst/$rel"
-
         ssz="$(stat_bytes "$src_f" 2>/dev/null || echo 0)"
         if [[ ! -f "$dst_f" ]]; then
             printf '%s\t%s\n' "$ssz" "$rel"
@@ -389,21 +563,16 @@ build_delta_list_generic(){
     done
 }
 
-# Human-readable bytes
 hr_bytes(){
     local b=$1 d=0 s=(B KB MB GB TB PB EB ZB YB)
     while (( b >= 1024 && d < ${#s[@]}-1 )); do b=$(( b/1024 )); d=$(( d+1 )); done
     echo "$b ${s[$d]}"
 }
 
-# Print preview summary and optionally list files
-# src_tmp/delta_tmp must contain "<size>\t<path>" lines
 preview_print_summary(){
     local src_tmp="$1" delta_tmp="$2" title="$3" src_count src_size delta_count delta_size
-
     src_count=$(wc -l < "$src_tmp" | tr -d ' ')
     src_size=$(awk -F '\t' '{s+=$1} END{print s+0}' "$src_tmp")
-
     delta_count=$(wc -l < "$delta_tmp" | tr -d ' ')
     delta_size=$(awk -F '\t' '{s+=$1} END{print s+0}' "$delta_tmp")
 
@@ -423,19 +592,21 @@ preview_print_summary(){
             fi
         fi
     fi
+    logmsg "PREVIEW src_files=$src_count src_bytes=$src_size delta_files=$delta_count delta_bytes=$delta_size title='$title'"
 }
 
-# Build and show preview
 run_preview(){
     local force_preview=0
     (( DRY_RUN )) && force_preview=1
-
+    if (( SKIP_PREVIEW )); then
+        logmsg "PREVIEW skipped"
+        return 0
+    fi
     if (( ! force_preview )); then
         if ! yesno "Preview copy plan first? (Y/n): " Y; then
             return 0
         fi
     fi
-
     local src_tmp delta_tmp title
     src_tmp=$(mktemp)
     delta_tmp=$(mktemp)
@@ -443,10 +614,8 @@ run_preview(){
     build_src_list > "$src_tmp"
     case "$SELECTED_TOOL" in
         cp)
-            # cp will clear destination ⇒ everything from src will be copied
             build_src_list > "$delta_tmp"; title="full copy from source" ;;
         *)
-            # rsync/rclone: backend-agnostic size+mtime delta
             build_delta_list_generic > "$delta_tmp"; title="delta (size+mtime)" ;;
     esac
 
@@ -454,18 +623,15 @@ run_preview(){
 
     rm -f "$src_tmp" "$delta_tmp"
 
-    # In dry-run: no proceed prompt
     if (( DRY_RUN )); then
         return 0
     fi
-
-    yesno "Proceed with copy? (Y/n): " Y || { echo "Aborted before copy."; exit 0; }
+    yesno "Proceed with copy? (Y/n): " Y || { echo "Aborted before copy."; logmsg "PROCEED declined"; exit 0; }
 }
 
 # ------------------------------ Tool selection ------------------------------
 SELECTED_TOOL=""
 
-# cp backend (coreutils)
 cp_tool(){
     if command -v cp >/dev/null 2>&1 && command -v rm >/dev/null 2>&1; then
         SELECTED_TOOL="cp"; echo "Selected: Standard (rm+cp)"; return 0
@@ -482,7 +648,6 @@ cp_tool(){
     echo "Not installing; choose another tool."; return 1
 }
 
-# rsync backend
 rsync_tool(){
     if ! command -v rsync >/dev/null 2>&1; then
         if (( DRY_RUN )); then
@@ -498,7 +663,6 @@ rsync_tool(){
     SELECTED_TOOL="rsync"; echo "Selected: rsync"; return 0
 }
 
-# rclone backend
 rclone_tool(){
     if ! command -v rclone >/dev/null 2>&1; then
         if (( DRY_RUN )); then
@@ -523,7 +687,6 @@ select_tool_by_name(){
     esac
 }
 
-# Minimal interactive picker for the backend
 choose_tool(){
     local default="$1" choice
     while true; do
@@ -542,25 +705,54 @@ choose_tool(){
 
 # ------------------------------- Main routine -------------------------------
 main(){
-    # 0) Parse CLI flags — -h/--help, --version, --dry-run, -t/--tool, -s/--src, -d/--dst work; others are stubs
-    parse_args "$@"
-    if (( ${#ARGS_UNIMPL[@]} > 0 )); then
-        echo "Note: the following CLI options/args are recognized but NOT IMPLEMENTED and will be ignored:"
-        printf '  %q\n' "${ARGS_UNIMPL[@]}"
-        echo
+    # 0) Pre-scan for explicit --config; create if missing
+    prescan_for_config "$@"
+
+    # 0.1) Decide effective default config path; auto-create if neither exists
+    if [[ -z "${CONFIG_FILE:-}" ]]; then
+        local base="${XDG_CONFIG_HOME:-$HOME/.config}"
+        local xdg_cfg="$base/dsm/config"
+        local legacy_cfg="$HOME/.dsm/config"
+        if [[ -f "$legacy_cfg" ]]; then
+            CONFIG_FILE="$legacy_cfg"
+        else
+            CONFIG_FILE="$xdg_cfg"
+            ensure_default_config "$CONFIG_FILE" || true
+        fi
     fi
 
-    # 1) Setup privilege helper (no keepalive) and detect package manager
+    # 1) Load config (it exists now or we proceed without if creation failed)
+    load_config_file "$CONFIG_FILE"
+
+    # 2) Parse CLI (overrides config)
+    parse_args "$@"
+
+    # 3) Apply config-derived defaults unless overridden by CLI
+    [[ -n "${CLI_LOG:-}" ]] && LOG_FILE="$CLI_LOG"
+    [[ -n "${CLI_SKIP:-}" ]] && parse_skip_list "$CLI_SKIP"
+    if (( DRY_RUN == 0 )) && [[ "${CFG_DRY_RUN:-}" == "1" ]]; then DRY_RUN=1; fi
+    if [[ -z "${TOOL_CHOICE:-}" && -n "${CFG_TOOL:-}" ]]; then TOOL_CHOICE="$CFG_TOOL"; fi
+
+    # 4) Initialize logging and privileges
+    init_log
+    logmsg "START version=$VERSION config='${CONFIG_FILE:-none}' dry_run=$DRY_RUN skip_preview=$SKIP_PREVIEW skip_backup=$SKIP_BACKUP skip_safety=$SKIP_SAFETY"
+
     setup_sudo
     detect_pkg_manager
 
-    # 2) Source/destination selection (CLI overrides interactive prompts)
+    # 5) Source/destination selection (CLI > config > interactive)
     if [[ -n "$CLI_SRC" ]]; then
-        # Non-interactive source path handling
         if [[ -d "$CLI_SRC" ]]; then
             absolute_src=$(readlink -f -- "$CLI_SRC")
         else
             echo "Source directory does not exist: $CLI_SRC" >&2
+            exit 2
+        fi
+    elif [[ -n "$CFG_SRC" ]]; then
+        if [[ -d "$CFG_SRC" ]]; then
+            absolute_src=$(readlink -f -- "$CFG_SRC")
+        else
+            echo "Source directory (from config) does not exist: $CFG_SRC" >&2
             exit 2
         fi
     else
@@ -568,7 +760,6 @@ main(){
     fi
 
     if [[ -n "$CLI_DST" ]]; then
-        # Non-interactive destination path handling
         if [[ -d "$CLI_DST" ]]; then
             absolute_dst=$(readlink -f -- "$CLI_DST")
         else
@@ -582,74 +773,102 @@ main(){
                 echo "Destination directory created: $absolute_dst"
             fi
         fi
+    elif [[ -n "$CFG_DST" ]]; then
+        if [[ -d "$CFG_DST" ]]; then
+            absolute_dst=$(readlink -f -- "$CFG_DST")
+        else
+            if (( DRY_RUN )); then
+                echo "DRY-RUN: directory does not exist and will not be created: $CFG_DST"
+                absolute_dst=$(path_abs "$CFG_DST")
+                echo "Using intended path for preview: $absolute_dst"
+            else
+                mkdir_safe "$CFG_DST"
+                absolute_dst=$(readlink -f -- "$CFG_DST")
+                echo "Destination directory created: $absolute_dst"
+            fi
+        fi
     else
         choose_dir "destination directory" dst create
     fi
 
+    logmsg "PATHS src='$absolute_src' dst='$absolute_dst'"
+
     echo
 
-    # 3) Safety checks before touching anything
-    #    3a) Same path
-    if [[ "$absolute_src" == "$absolute_dst" ]]; then
-        echo "Source and destination are the same. Aborting..." >&2; echo; exit 1
-    fi
-    #    3b) Destination MUST NOT be '/'
-    if [[ "$absolute_dst" == "/" ]]; then
-        echo "Destination path is '/'. Aborting..." >&2; echo; exit 1
-    fi
-    #    3c) Nesting in either direction leads to destructive surprises
-    if [[ "$absolute_src/" == "$absolute_dst"/* || "$absolute_dst/" == "$absolute_src"/* ]]; then
-        echo "Source and destination are nested. Aborting." >&2; echo; exit 1
-    fi
-    #    3d) Extra confirmation for sensitive single-component dirs
-    if [[ "$absolute_dst" =~ ^/(etc|home|var|bin|usr|lib|opt|tmp|srv|dev|mnt|media|proc|run|sys)(/)?$ ]]; then
-        echo "Destination is a sensitive directory: $absolute_dst"
-        yesno "Do you want to continue? (y/N): " N || { echo "Aborted..."; exit 1; }
-        yesno "Are you absolutely sure? (y/N): " N || { echo "Aborted..."; exit 1; }
+    # 6) Safety checks (unless skipped)
+    if (( ! SKIP_SAFETY )); then
+        if [[ "$absolute_src" == "$absolute_dst" ]]; then
+            echo "Source and destination are the same. Aborting..." >&2; echo; exit 1
+        fi
+        if [[ "$absolute_dst" == "/" ]]; then
+            echo "Destination path is '/'. Aborting..." >&2; echo; exit 1
+        fi
+        if [[ "$absolute_src/" == "$absolute_dst"/* || "$absolute_dst/" == "$absolute_src"/* ]]; then
+            echo "Source and destination are nested. Aborting." >&2; echo; exit 1
+        fi
+        if [[ "$absolute_dst" =~ ^/(etc|home|var|bin|usr|lib|opt|tmp|srv|dev|mnt|media|proc|run|sys)(/)?$ ]]; then
+            echo "Destination is a sensitive directory: $absolute_dst"
+            yesno "Do you want to continue? (y/N): " N || { echo "Aborted..."; exit 1; }
+            yesno "Are you absolutely sure? (y/N): " N || { echo "Aborted..."; exit 1; }
+        fi
+    else
+        echo "Safety checks skipped by configuration (--skip safety)." >&2
+        logmsg "SAFETY skipped"
     fi
 
-    # 4) Select backend
+    # 7) Select backend
     if [[ -n "$TOOL_CHOICE" ]]; then
         select_tool_by_name "$TOOL_CHOICE" || exit $?
     fi
     if [[ -z "$SELECTED_TOOL" ]]; then
         choose_tool 1
     fi
+    logmsg "TOOL selected=$SELECTED_TOOL"
 
-    # 5) PREVIEW — show what will be copied and how much
+    # 8) PREVIEW
     run_preview
 
     # In dry-run mode, stop here (no backup, no copy)
     if (( DRY_RUN )); then
         echo "DRY-RUN: no changes made."
+        logmsg "FINISH dry_run"
         exit 0
     fi
 
-    # 6) Backup existing destination to /tmp (if it exists)
+    # 9) Backup existing destination (unless skipped)
     local backup="(none)"
-    if [[ -e "$absolute_dst" ]]; then
-        backup=$(mktemp -d "/tmp/$(basename -- "$absolute_dst").$(date +%Y%m%dT%H%M%S%3N).XXXX")
-        cp -a -- "$absolute_dst"/. "$backup"/
+    if (( ! SKIP_BACKUP )); then
+        if [[ -e "$absolute_dst" ]]; then
+            backup=$(mktemp -d "/tmp/$(basename -- "$absolute_dst").$(date +%Y%m%dT%H%M%S%3N).XXXX")
+            cp -a -- "$absolute_dst"/. "$backup"/
+        fi
+    else
+        backup="(skipped)"
+        logmsg "BACKUP skipped"
     fi
 
-    # 7) Execute the chosen strategy
+    # 10) Execute the chosen strategy
     case "$SELECTED_TOOL" in
         rsync)
             # -a : archive; -H : preserve hard links; --delete : mirror; progress info
-            rsync -aH --delete --info=progress2 -- "$absolute_src"/ "$absolute_dst"/
+            # shellcheck disable=SC2086
+            rsync -aH --delete --info=progress2 $RSYNC_OPTS_EXTRA -- "$absolute_src"/ "$absolute_dst"/
             ;;
         rclone)
-            # make dst exactly match src; follow symlinks; optimize local copies
-            rclone sync --progress --copy-links --local-no-check-updated -- "$absolute_src" "$absolute_dst"
+            # Make dst exactly match src; follow symlinks; optimize local copies
+            # shellcheck disable=SC2086
+            rclone sync --progress --copy-links --local-no-check-updated $RCLONE_OPTS_EXTRA -- "$absolute_src" "$absolute_dst"
             ;;
         cp|*)
             # Emulate "sync": clear destination first (incl. dotfiles), then copy
             rm_tree_contents_safe "$absolute_dst"
-            cp -a -- "$absolute_src"/. "$absolute_dst"/
+            # shellcheck disable=SC2086
+            cp -a $CP_OPTS_EXTRA -- "$absolute_src"/. "$absolute_dst"/
             ;;
     esac
 
     echo "The task was completed successfully. Previous data backed up to: $backup"
+    logmsg "FINISH ok backup='$backup'"
     echo
 }
 
