@@ -86,9 +86,10 @@ Options:
   --no-sudo             Never attempt privilege escalation (sudo/doas). This
                         overrides config 'no_sudo=...' for the current run.
                         Operations requiring elevated permissions will fail.
+  --no-backup           Skip creating a temporary backup of the destination
+                        before syncing. Equivalent to '--skip backup' for this run.
 
 Additional (stubs):
-  --no-backup           [NOT IMPLEMENTED via CLI] Use '--skip backup' or config 'skip=backup'.
   --no-confirm          [NOT IMPLEMENTED]
   --copy                [NOT IMPLEMENTED]
 
@@ -316,7 +317,11 @@ parse_args(){
                 # Enforce "no elevation" mode for this run via CLI
                 DISALLOW_SUDO=1
                 ;;
-            --copy|--no-backup|--no-confirm)
+            --no-backup)
+                # Skip destination backup for this run via CLI
+                SKIP_BACKUP=1
+                ;;
+            --copy|--no-confirm)
                 # Still not implemented: record for potential diagnostics
                 ARGS_UNIMPL+=("$1")
                 ;;
