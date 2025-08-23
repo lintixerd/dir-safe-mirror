@@ -38,7 +38,7 @@ shopt -s extglob
 # NOTE: -h/--help, --version, --dry-run, -t/--tool, -s/--src, -d/--dst,
 #       --config, --log, and --skip are functional. Others remain stubs.
 SCRIPT_NAME="${0##*/}"
-VERSION="0.5.0"
+VERSION="0.6.0"
 DRY_RUN=0
 TOOL_CHOICE=""
 CLI_SRC=""
@@ -54,6 +54,7 @@ SKIP_PREVIEW=0
 SKIP_BACKUP=0
 SKIP_SAFETY=0
 DISALLOW_SUDO=0
+NO_CONFIRM=0
 CFG_TOOL=""
 CFG_DRY_RUN=""
 CFG_SRC=""
@@ -83,14 +84,14 @@ Options:
   --log FILE            Append actions to FILE (overrides config 'log=...').
   --skip STEPS          Comma list of steps to skip: preview,backup,safety
                         (merges with config 'skip=...').
-  --no-sudo             Never attempt privilege escalation (sudo/doas). This
-                        overrides config 'no_sudo=...' for the current run.
-                        Operations requiring elevated permissions will fail.
+  --no-sudo             Never attempt privilege escalation (sudo/doas).
+                        Overrides config 'no_sudo=...' for this run.
   --no-backup           Skip creating a temporary backup of the destination
-                        before syncing. Equivalent to '--skip backup' for this run.
+                        before syncing (same as '--skip backup' for this run).
+  --no-confirm          Do not ask any interactive questions; automatically use
+                        each prompt's default answer.
 
 Additional (stubs):
-  --no-confirm          [NOT IMPLEMENTED]
   --copy                [NOT IMPLEMENTED]
 
 Config file (key=value), example:
@@ -314,26 +315,26 @@ parse_args(){
                 shift
                 ;;
             --no-sudo)
-                # Enforce "no elevation" mode for this run via CLI
                 DISALLOW_SUDO=1
                 ;;
             --no-backup)
-                # Skip destination backup for this run via CLI
                 SKIP_BACKUP=1
                 ;;
-            --copy|--no-confirm)
-                # Still not implemented: record for potential diagnostics
+            --no-confirm)
+                NO_CONFIRM=1
+                ;;
+            --copy)
                 ARGS_UNIMPL+=("$1")
                 ;;
             --log=*|--skip=*|--config=*|-t=*|-s=*|-d=*)
                 echo "Use space-separated form (e.g., --log FILE), '=' form not supported." >&2
                 exit 2
                 ;;
-            --*)  # any other long option: record as stub
+            --*)
                 ARGS_UNIMPL+=("$1")
                 if [[ -n "${2:-}" && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
                 ;;
-            *)    # positional arguments (not used): record as stub
+            *)
                 ARGS_UNIMPL+=("$1")
                 ;;
         esac
@@ -436,7 +437,7 @@ rm_tree_contents_safe(){
 PKG_MGR=""; PKG_UPDATE=""; PKG_INSTALL=""; PKG_UPDATED=0
 
 detect_pkg_manager(){
-    if command -v apt-get >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2%; then
         PKG_MGR="apt"
         PKG_UPDATE="${SUDO:+$SUDO }apt-get update -qq"
         PKG_INSTALL="${SUDO:+$SUDO }env DEBIAN_FRONTEND=noninteractive apt-get install -y"
@@ -503,6 +504,16 @@ ensure_installed(){
 # ------------------------------- UI helpers ---------------------------------
 yesno(){
     local message="$1" default="$2" answer
+    # Non-interactive mode: auto-answer using the provided default
+    if (( NO_CONFIRM )); then
+        if [[ "${default^^}" == "Y" ]]; then
+            logmsg "AUTOANSWER yes msg=$(printf '%q' "$message")"
+            return 0
+        else
+            logmsg "AUTOANSWER no msg=$(printf '%q' "$message")"
+            return 1
+        fi
+    fi
     while true; do
         read -rp "$message" answer || true
         [[ -z "${answer:-}" ]] && answer="$default"
@@ -750,7 +761,7 @@ main(){
 
     # 4) Initialize logging and privileges
     init_log
-    logmsg "START version=$VERSION config='${CONFIG_FILE:-none}' dry_run=$DRY_RUN skip_preview=$SKIP_PREVIEW skip_backup=$SKIP_BACKUP skip_safety=$SKIP_SAFETY no_sudo=$DISALLOW_SUDO"
+    logmsg "START version=$VERSION config='${CONFIG_FILE:-none}' dry_run=$DRY_RUN skip_preview=$SKIP_PREVIEW skip_backup=$SKIP_BACKUP skip_safety=$SKIP_SAFETY no_sudo=$DISALLOW_SUDO no_confirm=$NO_CONFIRM"
 
     setup_sudo
     detect_pkg_manager
