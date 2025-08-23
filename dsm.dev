@@ -1,9 +1,42 @@
 #!/bin/bash
+# -----------------------------------------------------------------------------
+# Safe directory sync/copy helper — PREVIEW + COMMENTS (least-privilege)
+#
+# What this script does
+#   • Interactively asks for source and destination directories
+#   • Lets you choose a backend: (cp + rm), rsync, or rclone
+#   • Shows a PREVIEW before copying: how many files, total size, and an
+#     optional per-file list
+#   • Backs up current destination to /tmp before changing anything
+#   • Performs safety checks (same path, '/', nesting, sensitive dirs)
+#   • Avoids persistent sudo; elevates only when strictly needed (mkdir/rm,
+#     optional package installs). The copy itself runs unprivileged.
+#
+# Preview logic
+#   • cp: destination is cleaned before copy → preview = ALL source files
+#   • rsync/rclone: preview = files where size OR mtime differs between src/dst
+#
+# Notes
+#   • Indentation uses 4 spaces
+#   • Requires Bash features: [[ ... ]], declare -g, extglob, etc.
+#   • Config file (auto-created if missing):
+#       ${XDG_CONFIG_HOME:-$HOME/.config}/dsm/config
+#     Legacy fallback is read-only if present: ~/.dsm/config
+#     Keys: tool, log, skip, dry_run, no_sudo, src, dst, rsync_opts, rclone_opts, cp_opts
+# -----------------------------------------------------------------------------
 
+# Fail fast on errors, undefined vars, and pipeline errors
 set -Eeuo pipefail
+
+# Restrict word splitting to newlines/tabs only
 IFS=$'\n\t'
+
+# Enable bash extended globs (used for trimming and hidden-file patterns)
 shopt -s extglob
 
+# ------------------------------- CLI args (help & stubs) -------------------------------
+# NOTE: -h/--help, --version, --dry-run, -t/--tool, -s/--src, -d/--dst,
+#       --config, --log, and --skip are functional. Others remain stubs.
 SCRIPT_NAME="${0##*/}"
 VERSION="0.5.0"
 DRY_RUN=0
@@ -15,6 +48,7 @@ CLI_SKIP=""
 CONFIG_FILE=""
 declare -a ARGS_UNIMPL=()
 
+# Effective configuration (populated from config + CLI)
 LOG_FILE=""
 SKIP_PREVIEW=0
 SKIP_BACKUP=0
@@ -87,6 +121,7 @@ print_version(){
     echo "$SCRIPT_NAME $VERSION"
 }
 
+# --------------- Config loading (key=value, '#' comments, '~' expand) ---------------
 expand_tilde(){
     local p="${1-}"
     [[ -z "$p" ]] && { printf '%s\n' ""; return 0; }
@@ -103,6 +138,7 @@ trim(){
     printf '%s' "$s"
 }
 
+# Create a default config file with secure permissions if it does not exist
 ensure_default_config(){
     local target="$1"
     local parent; parent="$(dirname -- "$target")"
@@ -178,6 +214,7 @@ load_config_file(){
     done < "$f"
 }
 
+# Merge skips from a comma list into flags
 parse_skip_list(){
     local list="${1-}"
     [[ -z "$list" ]] && return 0
@@ -193,6 +230,8 @@ parse_skip_list(){
     done
 }
 
+# ---------------------------- Two-phase arg handling ----------------------------
+# Pre-scan for --config to set CONFIG_FILE (also auto-create if missing)
 prescan_for_config(){
     local i=1
     while (( i <= $# )); do
@@ -205,6 +244,7 @@ prescan_for_config(){
                 exit 2
             fi
             CONFIG_FILE="$val"
+            # Auto-create custom config path if missing
             ensure_default_config "$CONFIG_FILE" || true
             return 0
         fi
@@ -260,6 +300,7 @@ parse_args(){
                     exit 2
                 fi
                 CONFIG_FILE="$2"
+                # If user supplies a path and it doesn't exist, create it now
                 ensure_default_config "$CONFIG_FILE" || true
                 shift
                 ;;
@@ -307,6 +348,7 @@ parse_args(){
     done
 }
 
+# --------------------------- Error/Signal handlers ---------------------------
 on_err(){
     echo
     echo "Error (line $LINENO): $BASH_COMMAND" >&2
@@ -323,6 +365,7 @@ on_int(){
 trap on_err ERR
 trap on_int INT TERM
 
+# ------------------------------- Logging ---------------------------------
 logmsg(){
     [[ -z "${LOG_FILE:-}" ]] && return 0
     local ts; ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -339,25 +382,30 @@ init_log(){
     fi
 }
 
+# ------------------------------- Privileges ---------------------------------
 SUDO=""
 setup_sudo(){
+    # Honor 'no-sudo' from config or CLI: never set a sudo/doas helper
     if (( DISALLOW_SUDO )); then
         SUDO=""
         return 0
     fi
+    # If already root, no helper is needed
     if [[ $EUID -eq 0 ]]; then
         SUDO=""
         return 0
     fi
+    # Prefer sudo, then doas; otherwise leave empty to avoid elevation
     if command -v sudo >/dev/null 2>&1; then
         SUDO="sudo"; return 0
     fi
     if command -v doas >/dev/null 2>&1; then
         SUDO="doas"; return 0
     fi
-    SUDO=""
+    SUDO=""  # no helper available; privileged ops will fail with a message
 }
 
+# mkdir_safe <path>
 mkdir_safe(){
     local target="$1" parent
     parent=$(dirname -- "$target")
@@ -373,6 +421,7 @@ mkdir_safe(){
     fi
 }
 
+# rm_tree_contents_safe <dir>
 rm_tree_contents_safe(){
     local dir="$1"
     (
@@ -390,6 +439,7 @@ rm_tree_contents_safe(){
     )
 }
 
+# ---------------------------- Package management ----------------------------
 PKG_MGR=""; PKG_UPDATE=""; PKG_INSTALL=""; PKG_UPDATED=0
 
 detect_pkg_manager(){
@@ -419,7 +469,7 @@ detect_pkg_manager(){
         PKG_INSTALL="${SUDO:+$SUDO }pacman -S --noconfirm --needed"
     elif command -v apk >/dev/null 2>&1; then
         PKG_MGR="apk"
-        PKG_UPDATE=":"
+        PKG_UPDATE=":"   # Alpine: refresh during install with --no-cache
         PKG_INSTALL="${SUDO:+$SUDO }apk add --no-cache"
     elif command -v brew >/dev/null 2>&1; then
         PKG_MGR="brew"
@@ -453,11 +503,14 @@ ensure_installed(){
         return 1
     fi
     pkg_update_once
+    # shellcheck disable=SC2086
     eval "$PKG_INSTALL" $*
 }
 
+# ------------------------------- UI helpers ---------------------------------
 yesno(){
     local message="$1" default="$2" answer
+    # Non-interactive mode: auto-answer using the provided default
     if (( NO_CONFIRM )); then
         if [[ "${default^^}" == "Y" ]]; then
             logmsg "AUTOANSWER yes msg=$(printf '%q' "$message")"
@@ -514,6 +567,7 @@ choose_dir(){
     done
 }
 
+# ------------------------------ Preview helpers -----------------------------
 stat_bytes(){ stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1"; }
 stat_mtime(){ stat -c %Y -- "$1" 2>/dev/null || stat -f %m -- "$1"; }
 
@@ -613,6 +667,7 @@ run_preview(){
     yesno "Proceed with copy? (Y/n): " Y || { echo "Aborted before copy."; logmsg "PROCEED declined"; exit 0; }
 }
 
+# ------------------------------ Tool selection ------------------------------
 SELECTED_TOOL=""
 
 cp_tool(){
@@ -686,9 +741,12 @@ choose_tool(){
     done
 }
 
+# ------------------------------- Main routine -------------------------------
 main(){
+    # 0) Pre-scan for explicit --config; create if missing
     prescan_for_config "$@"
 
+    # 0.1) Decide effective default config path; auto-create if neither exists
     if [[ -z "${CONFIG_FILE:-}" ]]; then
         local base="${XDG_CONFIG_HOME:-$HOME/.config}"
         local xdg_cfg="$base/dsm/config"
@@ -701,20 +759,26 @@ main(){
         fi
     fi
 
+    # 1) Load config (it exists now or we proceed without if creation failed)
     load_config_file "$CONFIG_FILE"
+
+    # 2) Parse CLI (overrides config)
     parse_args "$@"
 
+    # 3) Apply config-derived defaults unless overridden by CLI
     [[ -n "${CLI_LOG:-}" ]] && LOG_FILE="$CLI_LOG"
     [[ -n "${CLI_SKIP:-}" ]] && parse_skip_list "$CLI_SKIP"
     if (( DRY_RUN == 0 )) && [[ "${CFG_DRY_RUN:-}" == "1" ]]; then DRY_RUN=1; fi
     if [[ -z "${TOOL_CHOICE:-}" && -n "${CFG_TOOL:-}" ]]; then TOOL_CHOICE="$CFG_TOOL"; fi
 
+    # 4) Initialize logging and privileges
     init_log
     logmsg "START version=$VERSION config='${CONFIG_FILE:-none}' dry_run=$DRY_RUN skip_preview=$SKIP_PREVIEW skip_backup=$SKIP_BACKUP skip_safety=$SKIP_SAFETY no_sudo=$DISALLOW_SUDO no_confirm=$NO_CONFIRM copy_mode=$COPY_MODE"
 
     setup_sudo
     detect_pkg_manager
 
+    # 5) Source/destination selection (CLI > config > interactive)
     if [[ -n "$CLI_SRC" ]]; then
         if [[ -d "$CLI_SRC" ]]; then
             absolute_src=$(readlink -f -- "$CLI_SRC")
@@ -769,6 +833,7 @@ main(){
 
     echo
 
+    # 6) Safety checks (unless skipped)
     if (( ! SKIP_SAFETY )); then
         if [[ "$absolute_src" == "$absolute_dst" ]]; then
             echo "Source and destination are the same. Aborting..." >&2; echo; exit 1
@@ -789,6 +854,7 @@ main(){
         logmsg "SAFETY skipped"
     fi
 
+    # 7) Select backend
     if [[ -n "$TOOL_CHOICE" ]]; then
         select_tool_by_name "$TOOL_CHOICE" || exit $?
     fi
@@ -797,14 +863,17 @@ main(){
     fi
     logmsg "TOOL selected=$SELECTED_TOOL"
 
+    # 8) PREVIEW
     run_preview
 
+    # In dry-run mode, stop here (no backup, no copy)
     if (( DRY_RUN )); then
         echo "DRY-RUN: no changes made."
         logmsg "FINISH dry_run"
         exit 0
     fi
 
+    # 9) Backup existing destination (unless skipped)
     local backup="(none)"
     if (( ! SKIP_BACKUP )); then
         if [[ -e "$absolute_dst" ]]; then
@@ -816,26 +885,39 @@ main(){
         logmsg "BACKUP skipped"
     fi
 
+    # 10) Execute the chosen strategy
     case "$SELECTED_TOOL" in
         rsync)
             if (( COPY_MODE )); then
+                # Non-destructive copy: no --delete
+                # shellcheck disable=SC2086
                 rsync -aH --info=progress2 $RSYNC_OPTS_EXTRA -- "$absolute_src"/ "$absolute_dst"/
             else
+                # Mirror mode: delete extraneous files
+                # shellcheck disable=SC2086
                 rsync -aH --delete --info=progress2 $RSYNC_OPTS_EXTRA -- "$absolute_src"/ "$absolute_dst"/
             fi
             ;;
         rclone)
             if (( COPY_MODE )); then
+                # Non-destructive copy
+                # shellcheck disable=SC2086
                 rclone copy --progress --copy-links --local-no-check-updated $RCLONE_OPTS_EXTRA -- "$absolute_src" "$absolute_dst"
             else
+                # Mirror mode (sync)
+                # shellcheck disable=SC2086
                 rclone sync --progress --copy-links --local-no-check-updated $RCLONE_OPTS_EXTRA -- "$absolute_src" "$absolute_dst"
             fi
             ;;
         cp|*)
             if (( COPY_MODE )); then
+                # Non-destructive copy: do not clean destination; prefer updating only when newer
+                # shellcheck disable=SC2086
                 cp -au $CP_OPTS_EXTRA -- "$absolute_src"/. "$absolute_dst"/
             else
+                # Emulate "sync": clear destination first (incl. dotfiles), then copy
                 rm_tree_contents_safe "$absolute_dst"
+                # shellcheck disable=SC2086
                 cp -a $CP_OPTS_EXTRA -- "$absolute_src"/. "$absolute_dst"/
             fi
             ;;
@@ -846,4 +928,5 @@ main(){
     echo
 }
 
+# ------------------------------- Entrypoint ---------------------------------
 main "$@"

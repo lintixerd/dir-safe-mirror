@@ -1,19 +1,23 @@
 # Dir Safe Mirror (Bash)
 
-A small interactive Bash script to **mirror** one directory into another using your choice of engine:
+A small interactive Bash script to **mirror** one directory into another (destructive sync) or perform a **non‑destructive copy** using your choice of engine:
 
-* **Standard**: `rm -rf` + `cp -a`
-* **rsync**: `rsync -aH --delete --info=progress2`
-* **rclone**: `rclone sync`
+* **Standard**: `rm -rf` + `cp -a` (mirror) or `cp -au` (copy mode)
+* **rsync**: `rsync -aH --delete --info=progress2` (mirror) or `rsync -aH --info=progress2` (copy mode)
+* **rclone**: `rclone sync` (mirror) or `rclone copy` (copy mode)
 
-It performs safety checks and makes a **backup of the destination** in `/tmp` before syncing.
+It performs safety checks and can make a **backup of the destination** in `/tmp` before syncing.
 
 ---
 
 ## Features
 
 * Engine selection: **cp**, **rsync**, or **rclone**
-* **Preview** before copying: total files, total size, optional per-file list
+* **Preview** before copying: total files, total size, optional per‑file list
+* **Two modes**:
+
+  * **Mirror** (default): destination becomes an exact mirror of source (extra files at destination are removed)
+  * **Copy mode** (`--copy`): non‑destructive; extra files at destination are **kept**
 * Safety checks:
 
   * Source and destination must differ
@@ -22,12 +26,13 @@ It performs safety checks and makes a **backup of the destination** in `/tmp` be
   * Detects nesting (src inside dst or dst inside src)
 * Destination backup to `/tmp` using a timestamped temp directory (can be skipped)
 * Graceful abort on **Ctrl+C**
-* Least privilege: elevates only when required (mkdir/rm, optional installs)
-* **Config file** with sane defaults, **auto-created** on first run
+* Least privilege: elevates only when required (mkdir/rm, optional installs); can be **forced off** with `--no-sudo`
+* **Config file** with sane defaults, **auto‑created** on first run
 * **Logging** to a file (configurable; defaults under XDG state directory)
 * **Skippable steps** via `--skip` or config: `preview`, `backup`, `safety`
-* **Non-interactive paths** via `-s/--src` and `-d/--dst`; default tool via `-t/--tool`
+* **Non‑interactive paths** via `-s/--src` and `-d/--dst`; default tool via `-t/--tool`
 * **Dry run** mode via `--dry-run` or config
+* **Unattended runs** with `--no-confirm` (auto‑answers prompts with their default)
 
 > If `rsync`/`rclone` are missing, the script can **offer to install** them (with your confirmation). Otherwise, pick another engine.
 
@@ -61,14 +66,14 @@ Optionally place it somewhere on your `PATH`.
 
 ## Configuration
 
-**Location (auto-created if missing):**
+**Location (auto‑created if missing):**
 
 * Primary: `${XDG_CONFIG_HOME:-$HOME/.config}/dsm/config`
-* Legacy (read if present; not auto-created): `~/.dsm/config`
+* Legacy (read if present; not auto‑created): `~/.dsm/config`
 
 **Format:** `key=value`. Lines starting with `#` are comments. The file is created with `chmod 600`.
 
-**Precedence:** `CLI > config > built-in defaults`. For `skip` lists, values are **merged** (union).
+**Precedence:** `CLI > config > built‑in defaults`. For `skip` lists, values are **merged** (union).
 
 **Defaults written on first run:**
 
@@ -91,12 +96,30 @@ cp_opts=
 **Supported keys:**
 
 * `tool=cp|rsync|rclone` — default engine.
-* `log=/path/to/file` — append logs here (directory auto-created). Default lives under `${XDG_STATE_HOME:-$HOME/.local/state}/dsm/dsm.log`.
-* `skip=preview,backup,safety` — comma-separated steps to skip.
+* `log=/path/to/file` — append logs here (directory auto‑created). Default lives under `${XDG_STATE_HOME:-$HOME/.local/state}/dsm/dsm.log`.
+* `skip=preview,backup,safety` — comma‑separated steps to skip.
 * `dry_run=true|false` — run without changing anything.
 * `no_sudo=true|false` — disallow privilege escalation; operations requiring it will fail.
-* `src=/path` / `dst=/path` — default source/destination (non-interactive).
+* `src=/path` / `dst=/path` — default source/destination (non‑interactive).
 * `rsync_opts=...` / `rclone_opts=...` / `cp_opts=...` — extra flags appended to the engine command.
+
+> There is **no config key** for copy vs mirror. Use `--copy` to enable copy mode for a run.
+
+---
+
+## CLI overview
+
+* `-s, --src DIR` — set source directory (non‑interactive)
+* `-d, --dst DIR` — set destination directory (non‑interactive)
+* `-t, --tool cp|rsync|rclone` — choose engine
+* `--dry-run` — simulate actions; no changes
+* `--skip preview,backup,safety` — skip steps (values merged with config)
+* `--no-sudo` — never escalate privileges (sudo/doas disabled)
+* `--no-backup` — skip destination backup (same as `--skip backup`)
+* `--no-confirm` — answer prompts automatically with their **default** (safety prompts default to **No**)
+* `--copy` — non‑destructive copy mode (keeps extra files in destination)
+* `--config FILE` — use explicit config path (auto‑created if missing)
+* `--log FILE` — override log file path
 
 ---
 
@@ -108,7 +131,7 @@ cp_opts=
 ./dsm
 ```
 
-You’ll be prompted to:
+You will be prompted to:
 
 1. Enter the **source** directory.
 2. Enter (or create) the **destination** directory.
@@ -123,9 +146,9 @@ You’ll be prompted to:
 
 On completion, the script prints where the destination backup was saved.
 
-> You can **abort** at any time with **Ctrl+C**. In yes/no prompts, you can also type `q`, `quit`, or `exit`.
+> Abort at any time with **Ctrl+C**. In yes/no prompts, `q`, `quit`, or `exit` will also exit.
 
-### Non-interactive examples
+### Non‑interactive examples
 
 Select source/destination and engine:
 
@@ -133,7 +156,7 @@ Select source/destination and engine:
 ./dsm -s ./src -d ./dst -t rsync
 ```
 
-Dry-run with preview auto-enabled, no changes applied:
+Dry‑run with preview auto‑enabled, no changes applied:
 
 ```bash
 ./dsm --dry-run -s ./src -d ./dst -t cp
@@ -143,6 +166,25 @@ Skip preview and backup (safety still on):
 
 ```bash
 ./dsm -s ./src -d ./dst --skip preview,backup -t rclone
+```
+
+Force no privilege escalation and no interactive questions:
+
+```bash
+./dsm -s ./src -d ./dst -t rsync --no-sudo --no-confirm
+```
+
+Enable **copy mode** (keep extra files at destination):
+
+```bash
+# cp engine: non-destructive update-in-place
+./dsm -s ./src -d ./dst -t cp --copy
+
+# rsync engine: no --delete
+./dsm -s ./src -d ./dst -t rsync --copy
+
+# rclone engine: use 'rclone copy'
+./dsm -s ./src -d ./dst -t rclone --copy
 ```
 
 Use a custom config file:
@@ -161,28 +203,29 @@ Send logs to a specific file (overrides config):
 
 ---
 
-## Preview Logic
+## Preview logic
 
-* **cp**: destination is cleared before copy → preview = **all source files**.
-* **rsync / rclone**: preview = files where **size OR mtime** differs between `src` and `dst` (computed locally and engine-agnostic).
+* **cp (mirror, default)**: destination is cleared before copy → preview = **all source files**.
+* **cp (copy mode, `--copy`)**: non‑destructive → preview = **delta** (files where size OR mtime differs).
+* **rsync / rclone**: preview = **delta** (size OR mtime differs) regardless of mode.
 
 The preview shows:
 
 * Count and total size **in source**
 * Count and total size that **will be transferred**
-* Optional per-file list
+* Optional per‑file list
 
 ---
 
-## Engine Behavior
+## Engine behavior
 
-| Engine     | Command (simplified)                                                                      | Notes                                                                                 |
-| ---------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| **cp**     | `rm -rf "$dst"/{*,.[!.]*,..?*}` → `cp -a "$src"/. "$dst"/`                                | Emulates mirror by clearing destination first (**including hidden files**) then copy. |
-| **rsync**  | `rsync -aH --delete --info=progress2 $rsync_opts "$src"/ "$dst"/`                         | True mirror. Deletes extraneous files, shows progress, preserves hard links.          |
-| **rclone** | `rclone sync --progress --copy-links --local-no-check-updated $rclone_opts "$src" "$dst"` | Mirror via rclone (local→local) with progress; follows symlinks on copy.              |
+| Engine     | Mirror command (simplified)                                                               | Copy‑mode command (simplified)                                                            | Notes                                                                                    |
+| ---------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| **cp**     | `rm -rf "$dst"/{*,.[!.]*,..?*}` → `cp -a "$src"/. "$dst"/`                                | `cp -au "$src"/. "$dst"/`                                                                 | Mirror clears destination (incl. dotfiles); copy mode updates in place and keeps extras. |
+| **rsync**  | `rsync -aH --delete --info=progress2 $rsync_opts "$src"/ "$dst"/`                         | `rsync -aH --info=progress2 $rsync_opts "$src"/ "$dst"/`                                  | Copy mode omits `--delete`, so extra files at destination are preserved.                 |
+| **rclone** | `rclone sync --progress --copy-links --local-no-check-updated $rclone_opts "$src" "$dst"` | `rclone copy --progress --copy-links --local-no-check-updated $rclone_opts "$src" "$dst"` | Copy mode uses `copy` instead of `sync`.                                                 |
 
-Extra per-engine options from the config are appended when present.
+Extra per‑engine options from the config are appended when present.
 
 ---
 
@@ -200,7 +243,7 @@ Example:
 /tmp/data.20250822T203012123.Kf8s
 ```
 
-Backups remain in `/tmp` until the system cleans them up. You can skip this step with `--skip backup` or `skip=backup` in the config.
+Backups remain in `/tmp` until the system cleans them up. You can skip this step with `--no-backup`, `--skip backup`, or `skip=backup` in the config.
 
 ---
 
@@ -210,7 +253,7 @@ If `log` is set (default: `${XDG_STATE_HOME:-$HOME/.local/state}/dsm/dsm.log`), 
 
 ---
 
-## Exit Codes
+## Exit codes
 
 * `0` — success (or a deliberate exit via prompt)
 * `1` — validation/operation error
@@ -218,7 +261,7 @@ If `log` is set (default: `${XDG_STATE_HOME:-$HOME/.local/state}/dsm/dsm.log`), 
 
 ---
 
-## Example Session
+## Example session
 
 ```
 Enter source directory: /data/src
@@ -245,9 +288,9 @@ The task was completed successfully. Previous data backed up to: /tmp/dst.202508
 
 ---
 
-## Known Limitations
+## Known limitations
 
-* Linux-only assumptions (`readlink -f`, Bash ≥ 4.2; GNU `find -printf`).
+* Linux‑only assumptions (`readlink -f`, Bash ≥ 4.2; GNU `find -printf`).
 * No checksum comparison in preview (size+mtime only).
 * Optional package installation is offered only when a supported package manager is detected.
-* Legacy config path `~/.dsm/config` is read if present but is not auto-created.
+* Legacy config path `~/.dsm/config` is read if present but is not auto‑created.
