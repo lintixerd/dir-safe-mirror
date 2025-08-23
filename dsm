@@ -83,9 +83,11 @@ Options:
   --log FILE            Append actions to FILE (overrides config 'log=...').
   --skip STEPS          Comma list of steps to skip: preview,backup,safety
                         (merges with config 'skip=...').
+  --no-sudo             Never attempt privilege escalation (sudo/doas). This
+                        overrides config 'no_sudo=...' for the current run.
+                        Operations requiring elevated permissions will fail.
 
 Additional (stubs):
-  --no-sudo             [NOT IMPLEMENTED via CLI] Use config 'no_sudo=true' instead.
   --no-backup           [NOT IMPLEMENTED via CLI] Use '--skip backup' or config 'skip=backup'.
   --no-confirm          [NOT IMPLEMENTED]
   --copy                [NOT IMPLEMENTED]
@@ -310,7 +312,12 @@ parse_args(){
                 CLI_SKIP="$2"
                 shift
                 ;;
-            --copy|--no-sudo|--no-backup|--no-confirm)
+            --no-sudo)
+                # Enforce "no elevation" mode for this run via CLI
+                DISALLOW_SUDO=1
+                ;;
+            --copy|--no-backup|--no-confirm)
+                # Still not implemented: record for potential diagnostics
                 ARGS_UNIMPL+=("$1")
                 ;;
             --log=*|--skip=*|--config=*|-t=*|-s=*|-d=*)
@@ -366,14 +373,17 @@ init_log(){
 # ------------------------------- Privileges ---------------------------------
 SUDO=""
 setup_sudo(){
+    # Honor 'no-sudo' from config or CLI: never set a sudo/doas helper
     if (( DISALLOW_SUDO )); then
         SUDO=""
         return 0
     fi
+    # If already root, no helper is needed
     if [[ $EUID -eq 0 ]]; then
         SUDO=""
         return 0
     fi
+    # Prefer sudo, then doas; otherwise leave empty to avoid elevation
     if command -v sudo >/dev/null 2>&1; then
         SUDO="sudo"; return 0
     fi
@@ -735,7 +745,7 @@ main(){
 
     # 4) Initialize logging and privileges
     init_log
-    logmsg "START version=$VERSION config='${CONFIG_FILE:-none}' dry_run=$DRY_RUN skip_preview=$SKIP_PREVIEW skip_backup=$SKIP_BACKUP skip_safety=$SKIP_SAFETY"
+    logmsg "START version=$VERSION config='${CONFIG_FILE:-none}' dry_run=$DRY_RUN skip_preview=$SKIP_PREVIEW skip_backup=$SKIP_BACKUP skip_safety=$SKIP_SAFETY no_sudo=$DISALLOW_SUDO"
 
     setup_sudo
     detect_pkg_manager
