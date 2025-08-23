@@ -31,12 +31,14 @@ IFS=$'\n\t'
 shopt -s extglob
 
 # ------------------------------- CLI args (help & stubs) -------------------------------
-# NOTE: -h/--help, --version, --dry-run, and -t/--tool are functional.
+# NOTE: -h/--help, --version, --dry-run, -t/--tool, -s/--src, and -d/--dst are functional.
 # All other flags are recognized but NOT IMPLEMENTED and are ignored.
 SCRIPT_NAME="${0##*/}"
-VERSION="0.3.0"
+VERSION="0.5.0"
 DRY_RUN=0
 TOOL_CHOICE=""
+CLI_SRC=""
+CLI_DST=""
 declare -a ARGS_UNIMPL=()
 
 print_help(){
@@ -52,11 +54,11 @@ Options:
                         skip package updates/installs, preview runs automatically,
                         and there is no proceed prompt.
   -t, --tool TOOL       Preselect backend: cp | rsync | rclone.
+  -s, --src DIR         Source directory path (non-interactive).
+  -d, --dst DIR         Destination directory path (non-interactive).
 
   --copy                [NOT IMPLEMENTED] Non-interactive copy using current/defaults.
   --config FILE         [NOT IMPLEMENTED] Load options from a config file.
-  -s, --src DIR         [NOT IMPLEMENTED] Source directory path.
-  -d, --dst DIR         [NOT IMPLEMENTED] Destination directory path.
   --skip STEPS          [NOT IMPLEMENTED] Comma-separated steps to skip:
                         preview,backup,safety
 
@@ -67,7 +69,7 @@ Additional (stubs):
   --log FILE            [NOT IMPLEMENTED] Append actions to FILE.
 
 Notes:
-  • All flags except -h/--help, --version, --dry-run, and -t/--tool are placeholders and currently do nothing.
+  • All flags except -h/--help, --version, --dry-run, -t/--tool, -s/--src, and -d/--dst are placeholders and currently do nothing.
 EOF
 }
 
@@ -90,27 +92,49 @@ parse_args(){
                 DRY_RUN=1
                 ;;
             -t|--tool)
-                shift || { echo "Missing value for --tool" >&2; exit 2; }
-                TOOL_CHOICE="${1,,}"
+                # Robustly require a value that is not another flag
+                if [[ -z "${2:-}" || "${2:-}" == -* ]]; then
+                    echo "Missing value for --tool" >&2
+                    exit 2
+                fi
+                TOOL_CHOICE="${2,,}"
                 case "$TOOL_CHOICE" in
                     cp|rsync|rclone) : ;;
                     *) echo "Unknown tool: $TOOL_CHOICE (expected: cp|rsync|rclone)" >&2; exit 2 ;;
                 esac
+                shift  # consume flag; loop's shift will consume value
+                ;;
+            -s|--src)
+                # Require a following path; avoid referencing \$1 after a shift with set -u
+                if [[ -z "${2:-}" || "${2:-}" == -* ]]; then
+                    echo "Missing value for --src" >&2
+                    exit 2
+                fi
+                CLI_SRC="$2"
+                shift  # consume flag; loop's shift will consume value
+                ;;
+            -d|--dst)
+                if [[ -z "${2:-}" || "${2:-}" == -* ]]; then
+                    echo "Missing value for --dst" >&2
+                    exit 2
+                fi
+                CLI_DST="$2"
+                shift
                 ;;
             --copy|--no-sudo|--no-backup|--no-confirm|--log)
                 ARGS_UNIMPL+=("$1")
                 # consume value for flags that expect one
                 if [[ "$1" == "--log" ]]; then
-                    if [[ $# -ge 2 && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
+                    if [[ -n "${2:-}" && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
                 fi
                 ;;
-            --config|--skip|-s|--src|-d|--dst)
+            --config|--skip)
                 ARGS_UNIMPL+=("$1")
-                if [[ $# -ge 2 && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
+                if [[ -n "${2:-}" && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
                 ;;
             --*)  # any other long option: record as stub
                 ARGS_UNIMPL+=("$1")
-                if [[ $# -ge 2 && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
+                if [[ -n "${2:-}" && "${2:-}" != -* ]]; then ARGS_UNIMPL+=("$2"); shift; fi
                 ;;
             *)    # positional arguments (not used): record as stub
                 ARGS_UNIMPL+=("$1")
@@ -518,7 +542,7 @@ choose_tool(){
 
 # ------------------------------- Main routine -------------------------------
 main(){
-    # 0) Parse CLI flags — -h/--help, --version, --dry-run, --tool work; others are stubs
+    # 0) Parse CLI flags — -h/--help, --version, --dry-run, -t/--tool, -s/--src, -d/--dst work; others are stubs
     parse_args "$@"
     if (( ${#ARGS_UNIMPL[@]} > 0 )); then
         echo "Note: the following CLI options/args are recognized but NOT IMPLEMENTED and will be ignored:"
@@ -530,9 +554,37 @@ main(){
     setup_sudo
     detect_pkg_manager
 
-    # 2) Ask for source/destination; offer to create destination
-    choose_dir "source directory" src
-    choose_dir "destination directory" dst create
+    # 2) Source/destination selection (CLI overrides interactive prompts)
+    if [[ -n "$CLI_SRC" ]]; then
+        # Non-interactive source path handling
+        if [[ -d "$CLI_SRC" ]]; then
+            absolute_src=$(readlink -f -- "$CLI_SRC")
+        else
+            echo "Source directory does not exist: $CLI_SRC" >&2
+            exit 2
+        fi
+    else
+        choose_dir "source directory" src
+    fi
+
+    if [[ -n "$CLI_DST" ]]; then
+        # Non-interactive destination path handling
+        if [[ -d "$CLI_DST" ]]; then
+            absolute_dst=$(readlink -f -- "$CLI_DST")
+        else
+            if (( DRY_RUN )); then
+                echo "DRY-RUN: directory does not exist and will not be created: $CLI_DST"
+                absolute_dst=$(path_abs "$CLI_DST")
+                echo "Using intended path for preview: $absolute_dst"
+            else
+                mkdir_safe "$CLI_DST"
+                absolute_dst=$(readlink -f -- "$CLI_DST")
+                echo "Destination directory created: $absolute_dst"
+            fi
+        fi
+    else
+        choose_dir "destination directory" dst create
+    fi
 
     echo
 
